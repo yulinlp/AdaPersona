@@ -260,6 +260,9 @@ def main():
             return False
     for spec in specs:
         atomic_json(root/'status'/(spec['name']+'.json'), dict(phase='queued'))
+    # Load metric resources before submitting parallel configurations.
+    for spec in specs:
+        adapter_for(spec).preflight()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         results = list(pool.map(execute, specs))
     atomic_json(root/'completion.json', dict(complete=all(results), settings=len(results), failed=results.count(False)))

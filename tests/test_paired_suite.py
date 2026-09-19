@@ -15,6 +15,17 @@ from scripts.blackbox_harness import CompiledHarness, runtime_row
 
 
 class PairedSuiteTest(unittest.TestCase):
+    def test_concurrent_metric_preflight_in_fresh_process(self):
+        import subprocess
+        import sys
+        result = subprocess.run([sys.executable, '-c',
+            'from concurrent.futures import ThreadPoolExecutor; '
+            'from scripts.evolution_metrics import preflight; '
+            'pool=ThreadPoolExecutor(10); '
+            'results=list(pool.map(lambda _: preflight(), range(20))); '
+            'assert len(results)==20; pool.shutdown()'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_baselines_never_receive_gold_and_use_public_qa(self):
         class QA:
             def generate(self, prompt, **kwargs):

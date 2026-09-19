@@ -27,7 +27,10 @@ _METEOR_LOCK = RLock()
 
 def preflight():
     # Missing lexical resources are an error, not a change of scoring protocol.
-    wordnet.ensure_loaded()
+    # LazyCorpusLoader mutates itself on first access. Use the same lock as
+    # scoring so concurrent benchmark preflights cannot race with METEOR.
+    with _METEOR_LOCK:
+        wordnet.ensure_loaded()
     row_metrics({'prediction': 'a short abstract', 'target': 'a brief abstract'})
     return {'protocol': METRIC_PROTOCOL, 'objective_protocol': OBJECTIVE_PROTOCOL,
             'objective_weights': OBJECTIVE_WEIGHTS, 'rouge': 'F1, Porter stemming',
