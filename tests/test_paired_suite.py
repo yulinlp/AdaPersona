@@ -15,6 +15,16 @@ from scripts.blackbox_harness import CompiledHarness, runtime_row
 
 
 class PairedSuiteTest(unittest.TestCase):
+    def test_answer_requests_disallow_immediate_eos(self):
+        from scripts.longlamp_rsi import VLLMOpenAIClient
+        client = VLLMOpenAIClient('unused', 'answer', chat_template_kwargs={'enable_thinking': False})
+        with patch.object(client, '_request', return_value='answer') as request:
+            client.generate_batch(['task'], max_new_tokens=128)
+        payload = request.call_args.args[1]
+        self.assertEqual(payload['min_tokens'], 1)
+        self.assertEqual(payload['temperature'], 0)
+        self.assertEqual(payload['seed'], 0)
+
     def test_concurrent_metric_preflight_in_fresh_process(self):
         import subprocess
         import sys

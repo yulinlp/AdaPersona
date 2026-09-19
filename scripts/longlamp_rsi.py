@@ -547,6 +547,10 @@ class VLLMOpenAIClient:
                     {"role": "user", "content": prompt},
                 ],
                 "max_tokens": int(max_new_tokens),
+                # Every task requires a nonempty answer. Disallow immediate
+                # EOS while retaining greedy deterministic decoding. This is
+                # shared by baselines, adaptation and held-out evaluation.
+                "min_tokens": 1,
                 "temperature": float(temperature if do_sample else 0.0),
                 "top_p": float(top_p if do_sample else 1.0),
                 # Keep the frozen Answer Agent/evaluation path fully

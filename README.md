@@ -80,7 +80,7 @@ The initial suite uses **2 users per task**, selected in source-file order befor
 
 Quality/objective scores are displayed on a 0–100 scale. Raw MAE/RMSE are lower-is-better and remain in rating units. Do not combine different tasks into one purported benchmark score.
 
-QA requests use temperature=0, top_p=1, top_k=1, seed=0 and thinking disabled. The evolver uses temperature=0.7, top_p=0.9, without an explicit output-token cap; serving context remains a hard limit. Request settings alone do not prove server determinism. Confirmations and code hashes support auditing repeated executions.
+QA requests use temperature=0, top_p=1, top_k=1, seed=0, min_tokens=1 and thinking disabled. The one-token minimum prevents immediate EOS on tasks requiring nonempty answers; it applies equally to baselines, adaptation and test evaluation. The evolver uses temperature=0.7, top_p=0.9, without an explicit output-token cap or minimum; serving context remains a hard limit. Request settings alone do not prove server determinism. Confirmations and code hashes support auditing repeated executions.
 
 ## Run
 

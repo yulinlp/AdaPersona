@@ -183,6 +183,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
         predictions = evaluate(code, 'seed')
         baseline = adapter.summarize_rows(predictions, trace_limit=len(rows))
         if baseline['errors']:
+            evo.write_jsonl(directory/'seed_failed_predictions.jsonl', predictions)
             raise RuntimeError('Seed evaluation failed; do not optimize against a broken baseline')
         evo.save_code(directory / 'seed.py', code)
         evo.write_jsonl(directory / 'seed_predictions.jsonl', predictions)
