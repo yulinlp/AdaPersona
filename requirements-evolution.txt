@@ -1,0 +1,6 @@
+# Install into the existing vLLM experiment environment, not the model server.
+nltk==3.9.2
+rouge-score==0.1.2
+sacrebleu==2.5.1
+# Existing runtime: numpy, scipy, scikit-learn, networkx.
+# METEOR additionally requires NLTK wordnet under data/nltk_data/corpora.

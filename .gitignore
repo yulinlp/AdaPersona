@@ -1,0 +1,21 @@
+# Local datasets, generated pilots, model outputs and long-running experiment artifacts.
+data/
+logs/
+*.err
+*.out
+*.log
+*.tmp
+*.jsonl
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Local presentation and scratch files; the repository is the executable method.
+*.pptx
+*.ipynb_checkpoints/
+
+# Per-run snapshots/checkpoints created outside the source tree.
+run_config.json
+runner.json
+runner.lock
+source_snapshot/
