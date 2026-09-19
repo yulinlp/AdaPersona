@@ -68,6 +68,16 @@ The project uses rouge-score 0.1.2, NLTK 3.9.2 METEOR with WordNet, and
 sacrebleu 2.5.1 sentence BLEU. Reports expose ROUGE-1, ROUGE-L, BLEU, METEOR,
 and the weighted score on a 0--100 scale. Title coverage is diagnostic only.
 
+## Hidden per-round test monitoring
+
+For visibility during a long run, scripts/monitor_hidden_test.py can watch
+operation-complete events and score the current harness on the official
+one-row-per-user test split after each operation. This is a side-channel
+measurement only: test rows and targets remain in the monitor process, its
+output is written outside the evolution run directory, and no hidden score is
+available to the Code Agent, failure bank, parent selection, or acceptance
+decision. The final test report remains the post-run frozen evaluation.
+
 ## Artifacts and restart behavior
 
 The runner checkpoints after each operation. A run stores `run_config.json`,

@@ -65,6 +65,17 @@ python scripts/evaluate_profile_only_test.py \
   --output-dir data/experiments/longlamp_abstract_user_rsi_tta/runs/official_test_scores
 ```
 
+For a live view of official test performance after every completed evolution
+operation, run the independent hidden-test monitor:
+
+    python scripts/monitor_hidden_test.py \
+      --run-dir data/experiments/longlamp_abstract_user_rsi_tta/runs/profile_only_v5_i10_b4 \
+      --test data/experiments/longlamp_abstract_user_rsi_tta/test.jsonl \
+      --output-dir data/experiments/longlamp_abstract_user_rsi_tta/shadow_test_monitor
+
+It writes only metrics outside the evolution run directory. Hidden targets and
+scores never enter candidate selection, the failure bank, or Code Agent prompts.
+
 ## V5 search contract
 
 Each operation has two families: `macro_strategy` proposes a substantially
