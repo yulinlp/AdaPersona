@@ -88,6 +88,10 @@ class BlackboxHarnessTest(unittest.TestCase):
         self.assertIsNotNone(proposal)
         self.assertEqual(proposal["code"].splitlines()[-1], "    return 'child'")
 
+    def test_unclosed_python_fence_is_accepted_when_source_is_complete(self):
+        code = '```python\ndef run(row, qa):\n    return "ok"\n'
+        self.assertEqual(CompiledHarness(code).run({}, FakeQA()), "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

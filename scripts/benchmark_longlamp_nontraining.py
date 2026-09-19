@@ -496,6 +496,11 @@ def main() -> None:
             served_model,
             timeout=args.vllm_timeout,
             concurrency=args.vllm_concurrency,
+            chat_template_kwargs=(
+                {"enable_thinking": False}
+                if "qwen3" in served_model.lower()
+                else None
+            ),
         )
     else:
         tokenizer, model = load_model(args.model, args.model_manifest, args.transformers_path)
@@ -514,6 +519,11 @@ def main() -> None:
             args.prompt_vllm_model,
             timeout=args.prompt_vllm_timeout,
             concurrency=args.prompt_vllm_concurrency,
+            chat_template_kwargs=(
+                {"enable_thinking": False}
+                if "qwen3" in args.prompt_vllm_model.lower()
+                else None
+            ),
         )
         prompt_model_name = args.prompt_vllm_model
 

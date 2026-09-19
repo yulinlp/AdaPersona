@@ -7,7 +7,7 @@ combination of memory, retrieval, graph construction, prompting, candidate
 selection, and multi-call refinement that can be expressed through an
 ordinary vLLM chat-completions API.
 
-Each evolution step has exactly two operation families:
+Each evolution round chooses one of two operation families:
 
 1. ``macro_strategy``: replace or substantially restructure the main
    personalization strategy;
@@ -275,7 +275,8 @@ class FailureBank:
             for key in keys:
                 entries = sorted(groups[key], key=lambda e: (
                     "execution_error" not in e.get("failure_types", []),
-                    e.get("rougeL", 0), str(e.get("sample_id", ""))))
+                    e.get("weighted_score", e.get("rougeL", 0)),
+                    str(e.get("sample_id", ""))))
                 if depth >= len(entries):
                     continue
                 item = dict(entries[depth])
@@ -298,7 +299,17 @@ def _history_summary(history, limit=24):
     keys = ("event", "iteration", "operation", "candidate_id", "accepted", "accepted_candidate",
             "delta_rougeL", "delta_weighted_score", "parent_rougeL", "child_rougeL",
             "weighted_score_100", "hypothesis", "error", "exploration_parent")
-    return [{k: r[k] for k in keys if k in r} for r in history[-limit:]]
+    result = []
+    for record in history[-limit:]:
+        value = {k: record[k] for k in keys if k in record}
+        # LaMP-2/3 use accuracy-oriented objectives.  Preserve all task
+        # metric deltas without making the shared prompt know their names.
+        for key, item in record.items():
+            if (key.startswith(("mean_", "parent_", "child_", "delta_"))
+                    and key not in value and isinstance(item, (int, float))):
+                value[key] = item
+        result.append(value)
+    return result
 
 
 def _archive_summary(archive, limit=8):
@@ -306,8 +317,15 @@ def _archive_summary(archive, limit=8):
     import difflib
     if not archive:
         return []
-    ranked = sorted(archive, key=lambda r: (
-        bool(r.get("accepted")), r.get("weighted_score", -1), r.get("mean_rougeL", -1)), reverse=True)
+    def rank_key(record):
+        metric_values = [float(value) for key, value in record.items()
+                         if key.startswith("mean_") and not key.endswith("_100")
+                         and isinstance(value, (int, float))]
+        return (bool(record.get("accepted")),
+                float(record.get("weighted_score", -1)),
+                max(metric_values, default=-1.0))
+
+    ranked = sorted(archive, key=rank_key, reverse=True)
     chosen = []
     for item in [archive[-1], *ranked, *reversed(archive)]:
         if item.get("candidate_id") not in {x.get("candidate_id") for x in chosen}:
@@ -339,7 +357,8 @@ def load_strategy_library(path: Path | None = None) -> str:
 
 RUNTIME_CONTRACT = '''Only fixed interface: synchronous def run(row, qa) -> str.
 row contains user_id, sample_id, input, profile; NEVER the current reference answer.
-profile is a list of historical title/abstract dictionaries (other metadata may exist).
+profile is a list of task-specific historical dictionaries; fields may include
+titles, text, abstracts, labels, scores, dates, or other public profile metadata.
 Each sample runs in a fresh process: classes/functions are supported; globals do not persist.
 qa exposes ONLY:
   generate(prompt: str, *, system='You are a helpful assistant.', max_tokens=256,
@@ -348,6 +367,8 @@ qa exposes ONLY:
   embed(texts: list[str], *, instruction=None) -> list[list[float]]
 generate_many counts each prompt against the 8-generation-call budget. All runtime
 generation, judging and summarizing MUST use this frozen Qwen2.5-7B-Instruct client.
+The broker clamps temperature/top_p to deterministic temperature=0, top_p=1,
+top_k=1, seed=0 during evaluation; do not rely on sampling noise for a gain.
 Target context capacity is 8192 tokens INCLUDING output; choose prompts and max_tokens accordingly.
 Embeddings are optional frozen Qwen3-Embedding-0.6B, normalized 1024D vectors, max 2048
 tokens per text (longer texts truncate); instruction is optional and task-dependent.
@@ -378,7 +399,9 @@ def runtime_contract_for(model_id='Qwen2.5-7B-Instruct', context_tokens=8192):
 def evolution_prompt(*, parent_code, operation, iteration, branch, current_summary,
                      failure_bank, history, archive, strategy_library,
                      agent_model='Qwen/Qwen3.8-27B',
-                     runtime_model='Qwen2.5-7B-Instruct', runtime_context=8192):
+                     runtime_model='Qwen2.5-7B-Instruct', runtime_context=8192,
+                     task_context=None, objective_description=None,
+                     evaluation_boundary=None):
     instruction = (
         "Explore a substantively different, evidence-supported hypothesis. You may replace the entire workflow; "
         "the parent is a comparison point, not a required template."
@@ -402,22 +425,33 @@ def evolution_prompt(*, parent_code, operation, iteration, branch, current_summa
         {k: v for k, v in item.items() if k != 'user_id'}
         for item in _archive_summary(archive, 3)
     ]
+    task_context = task_context or (
+        'Benchmark: LongLaMP abstract generation. The harness receives an abstract task and '
+        'historical title/abstract dictionaries and must return only the current abstract.'
+    )
+    objective_description = objective_description or (
+        'maximize this user\'s weighted training score (0-100): '
+        '0.25*ROUGE-1 + 0.35*ROUGE-L + 0.20*BLEU + 0.20*METEOR'
+    )
+    evaluation_boundary = evaluation_boundary or (
+        'No held-out targets are available. We are measuring training fitting, NOT generalization.'
+    )
     return f'''You are {agent_model}, the training-time Python harness evolver for ONE isolated user.
 Step {iteration}; operation={operation}; branch={branch}.
 {instruction}
 
 {runtime_contract_for(runtime_model, runtime_context)}
 
-Primary objective: maximize this user's weighted training score (0-100), with zero execution errors.
-The score is 0.25*ROUGE-1 + 0.35*ROUGE-L + 0.20*BLEU + 0.20*METEOR.
+Task-specific contract and allowed historical evidence:
+{task_context}
+
+Primary objective: {objective_description}, with zero execution errors.
 Treat execution logs as evidence: a zero-error evaluated parent is executable. Do not invent
 syntax errors or pretend unavailable references/tools were observed. Distinguish hypotheses from facts.
-The four component metrics and ROUGE-L remain visible as diagnostics. Title-word coverage is NOT
-an objective or proof of factual correctness.
 Do not optimize title repetition, code length, complexity or number of tool calls for their own sake.
 Training references below are available for diagnosis only. Infer reusable user-specific behavior;
 never embed reference answers, task-to-answer tables, sample-ID lookup, or disguised answer memorization.
-No held-out targets are available. We are measuring training fitting, NOT generalization.
+{evaluation_boundary}
 
 The library is non-exhaustive and unranked. Any idea may be ignored or combined.
 Simple approaches and novel approaches are equally valid. No retrieval, graph, embedding,
@@ -630,7 +664,12 @@ Use these as hypotheses, not mandatory modules; implement and test one causal ch
                         'sample_id','failure_types','scores_100','delta_rougeL','error','event',
                         'mean_rougeL_100','child_rougeL','parent_rougeL',
                         'weighted_score_100','delta_weighted_score'}
-                compact = [{k:v for k,v in item.items() if k in keys} for item in records]
+                compact = []
+                for item in records:
+                    compact.append({
+                        k: v for k, v in item.items()
+                        if k in keys or k.startswith(("mean_", "parent_", "child_", "delta_"))
+                    })
                 prompt = prompt[:start] + section[:split] + '\n' + json.dumps(compact, ensure_ascii=False) + '\n\n' + prompt[end:]
                 omitted.append('Historical metadata-only: ' + start_marker)
                 tokens = count(prompt)
@@ -699,13 +738,28 @@ def behavior_fingerprint(code):
 
 
 def reference_literal_leak(code, rows):
-    """Catch direct reference embedding, not a proof against arbitrary obfuscation."""
+    """Catch direct answer/input lookup literals.
+
+    LongLaMP references are long enough for the old target-only check.  LaMP
+    classification/rating targets are intentionally short, so checking the
+    target vocabulary itself would reject legitimate category/rating logic.
+    Instead, reject complete long training inputs and exact sample IDs as the
+    lookup key.  This is a conservative direct-leak check, not a proof
+    against arbitrary obfuscation or learned semantic memorization.
+    """
     literals = [' '.join(n.value.split()) for n in ast.walk(ast.parse(code))
                 if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    literal_set = set(literals)
     for row in rows:
         gold = ' '.join(str(row.get('target', '')).split())
         if len(gold) >= 100 and any(gold in text for text in literals):
             return 'candidate embeds a complete training reference literal; infer a policy, not answers'
+        sample_id = ' '.join(str(row.get('sample_id', '')).split())
+        if len(sample_id) >= 8 and sample_id in literal_set:
+            return 'candidate embeds a training sample_id lookup; infer a policy, not answer tables'
+        current_input = ' '.join(str(row.get('input', '')).split())
+        if len(current_input) >= 80 and any(current_input in text for text in literals):
+            return 'candidate embeds a complete training input lookup; infer a policy, not answer tables'
     return None
 
 
@@ -766,12 +820,88 @@ def _parse_hypotheses(response: str, count: int) -> list[str]:
     return [hypothesis.strip() for hypothesis in hypotheses]
 
 
+def parse_operation_choice(response):
+    """Parse a data-only Python decision, never execute agent output."""
+    text = response.strip()
+    if text.startswith('```'):
+        text = '\n'.join(text.splitlines()[1:])
+        if text.rstrip().endswith('```'):
+            text = text.rstrip()[:-3]
+    tree = ast.parse(text)
+    values = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            raise ValueError('Operation decision must contain only literal assignments')
+        name = node.targets[0].id
+        if name not in ('operation', 'reason') or name in values:
+            raise ValueError('Unexpected or duplicate operation decision field')
+        values[name] = ast.literal_eval(node.value)
+    if values.get('operation') not in OPERATION_NAMES:
+        raise ValueError('Choose exactly one supported operation')
+    if not isinstance(values.get('reason'), str) or not values['reason'].strip():
+        raise ValueError('Operation choice requires an evidence-grounded reason')
+    return values
+
+
+def choose_operation(*, parent_code, iteration, current_summary, failure_bank,
+                     history, archive, task_context, agent_api_url, agent_api_model,
+                     agent_timeout, request_gate, artifact_dir):
+    """Select one operation using historical adaptation evidence only."""
+    import uuid
+    from contextlib import nullcontext
+    destination = Path(artifact_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    def record(value):
+        (destination / (uuid.uuid4().hex + '.json')).write_text(
+            json.dumps(value, ensure_ascii=False, indent=2))
+    evidence = dict(iteration=iteration, task=task_context,
+                    adaptation_summary=current_summary,
+                    failure_bank=failure_bank.prompt_view(),
+                    history=_history_summary(history), archive=_archive_summary(archive))
+    prompt = '''Choose exactly ONE operation for this user's next evolution round.
+macro_strategy: substantially change the personalization strategy or architecture.
+micro_repair: retain the strategy and fix or refine its implementation.
+Neither operation is preferred. There is no alternation schedule or quota; consecutive
+rounds may choose the same operation. Ground the choice in the evidence, uncertainty,
+and prior attempts. All supplied diagnostics come from historical-profile adaptation.
+Never request or use the current held-out test answer or test performance.
+Return only two Python literal assignments (no implementation yet):
+operation = "<choose macro_strategy or micro_repair>"
+reason = "evidence supporting the choice"
+EVIDENCE:\n'''
+    def scrub(value):
+        if isinstance(value, dict):
+            return {k: scrub(v) for k, v in value.items() if k != 'user_id'}
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        return value
+    evidence = scrub(evidence)
+    # Match the context manager's section contract, preserving the full parent
+    # and supporting progressive compression of history rather than failure.
+    prompt += f"Step {iteration}; operation=selection; branch=0.\n"
+    prompt += 'Task:\n' + task_context + '\n\nCurrent branch evaluation;\n'
+    prompt += json.dumps(evidence['adaptation_summary'], ensure_ascii=False)
+    prompt += '\n\nTraining feedback sampled ACROSS previous steps\n'
+    prompt += json.dumps(evidence['failure_bank'], ensure_ascii=False)
+    prompt += '\n\nEvolution history (adaptation only)\n' + json.dumps(evidence['history'], ensure_ascii=False)
+    prompt += '\n\nHistorical alternatives with actual source/diffs\n' + json.dumps(evidence['archive'], ensure_ascii=False)
+    prompt += '\n\nCurrent branch source (replaceable):\n```python\n' + parent_code + '\n```'
+    with request_gate if request_gate is not None else nullcontext():
+        prompt = fit_agent_context(prompt, agent_api_url, record, agent_api_model)
+        response = agent_chat(agent_api_url, agent_api_model, prompt,
+                              timeout=agent_timeout, retries=2, retry_wait=2,
+                              max_tokens=None, record=record)
+    # Fail rather than silently substituting a hand-designed operation schedule.
+    return parse_operation_choice(response)
+
+
 def plan_hypotheses(*, parent_code, operation, iteration, count, current_summary,
                     failure_bank, history, archive, strategy_library,
                     agent_api_url, agent_api_model, agent_timeout, agent_retries,
                     agent_retry_wait, agent_max_tokens, request_gate=None,
                     artifact_dir=None, runtime_model='Qwen2.5-7B-Instruct',
-                    runtime_context=8192) -> list[str]:
+                    runtime_context=8192, task_context=None,
+                    objective_description=None, evaluation_boundary=None) -> list[str]:
     """Plan the whole operation before splitting candidates across parents.
 
     Archive-beam often gives one proposal slot to each parent.  Planning inside
@@ -821,6 +951,9 @@ def plan_hypotheses(*, parent_code, operation, iteration, count, current_summary
         agent_model=agent_api_model,
         runtime_model=runtime_model,
         runtime_context=runtime_context,
+        task_context=task_context,
+        objective_description=objective_description,
+        evaluation_boundary=evaluation_boundary,
     )
     try:
         response = request(base + f"""
@@ -829,8 +962,7 @@ for this operation. These hypotheses will be assigned to different parent branch
 must identify one causal change and a concrete test. Cover different directions when the
 evidence permits; do not return generic placeholders or repeat a previous failure.
 For this planning request ONLY return Python comment lines, one per hypothesis:
-# HYPOTHESIS 1: your hypothesis, supporting evidence, and proposed test
-# HYPOTHESIS 2: a different hypothesis, evidence, and proposed test
+{chr(10).join(f'# HYPOTHESIS {i}: distinct hypothesis, supporting evidence, proposed test' for i in range(1, count + 1))}
 Continue to the requested count. Do not quote strings or implement the harness yet.
 """)
         return _parse_hypotheses(response, count)
@@ -850,7 +982,8 @@ def propose_candidates(*, parent_code, operation, iteration, count, current_summ
                        agent_api_model, agent_timeout, agent_retries, agent_retry_wait,
                        agent_concurrency, agent_max_tokens, request_gate=None, artifact_dir=None,
                        planned_hypotheses=None, runtime_model='Qwen2.5-7B-Instruct',
-                       runtime_context=8192):
+                       runtime_context=8192, task_context=None,
+                       objective_description=None, evaluation_boundary=None):
     import uuid
     from contextlib import nullcontext
     def record(value):
@@ -871,7 +1004,10 @@ def propose_candidates(*, parent_code, operation, iteration, count, current_summ
                             branch="planning", current_summary=current_summary,
                             failure_bank=failure_bank, history=history, archive=archive,
                             strategy_library=strategy_library, agent_model=agent_api_model,
-                            runtime_model=runtime_model, runtime_context=runtime_context)
+                            runtime_model=runtime_model, runtime_context=runtime_context,
+                            task_context=task_context,
+                            objective_description=objective_description,
+                            evaluation_boundary=evaluation_boundary)
     hypotheses = []
     planning_error = None
     if planned_hypotheses is not None:
@@ -902,7 +1038,9 @@ Each item should explain a different causal change and how it can be tested.
                                   branch=branch, current_summary=current_summary, failure_bank=failure_bank,
                                   history=history, archive=archive, strategy_library=strategy_library,
                                   agent_model=agent_api_model, runtime_model=runtime_model,
-                                  runtime_context=runtime_context)
+                                  runtime_context=runtime_context, task_context=task_context,
+                                  objective_description=objective_description,
+                                  evaluation_boundary=evaluation_boundary)
         prompt += "\nYour hypothesis: " + hypotheses[branch]
         prompt += "\nOther branches (do not duplicate their central change): " + json.dumps(
             [h for i, h in enumerate(hypotheses) if i != branch], ensure_ascii=False)

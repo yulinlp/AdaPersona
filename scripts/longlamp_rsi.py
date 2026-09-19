@@ -508,7 +508,13 @@ class VLLMOpenAIClient:
                 if not choices:
                     raise RuntimeError(f"vLLM returned no choices for prompt: {prompt[:120]!r}")
                 message = choices[0].get("message") or {}
-                return str(message.get("content", "")).strip()
+                content = message.get("content")
+                if content is None:
+                    raise RuntimeError(
+                        "model returned null message.content; check chat_template_kwargs "
+                        "(Qwen3 requires enable_thinking=false for this contract)"
+                    )
+                return str(content).strip()
             except (OSError, ValueError, RuntimeError, urllib.error.HTTPError) as error:
                 last_error = error
                 if attempt >= self.retries:
@@ -543,6 +549,11 @@ class VLLMOpenAIClient:
                 "max_tokens": int(max_new_tokens),
                 "temperature": float(temperature if do_sample else 0.0),
                 "top_p": float(top_p if do_sample else 1.0),
+                # Keep the frozen Answer Agent/evaluation path fully
+                # deterministic.  The service also receives seed=0 below;
+                # top_k=1 prevents a serving-side default from reintroducing
+                # sampling when temperature is zero.
+                "top_k": 1,
                 # Pin the OpenAI-compatible sampling seed so a repeated
                 # parent evaluation is comparable to the stored baseline even
                 # when vLLM receives requests in a different batch order.

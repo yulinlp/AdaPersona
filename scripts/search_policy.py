@@ -6,7 +6,7 @@ but provides a bounded, reproducible population policy for the next protocol:
 
 * every recent candidate and globally strong candidate remains a possible
   parent within the bounded archive;
-* a Pareto front over the four quality metrics is protected;
+* a Pareto front over the current task's quality metrics is protected;
 * parent slots mix elite, novel, under-explored, and island-diverse nodes;
 * the final incumbent can still be selected by the scalar weighted objective.
 
@@ -25,10 +25,30 @@ from typing import Any, Iterable
 QUALITY_KEYS = ("mean_rouge1", "mean_rougeL", "mean_bleu", "mean_meteor")
 
 
+def metric_keys(summary: dict[str, Any]) -> tuple[str, ...]:
+    """Return the objective dimensions for the current benchmark/task.
+
+    LongLaMP uses text-overlap metrics, while LaMP-2/3 use label/rating
+    metrics.  The archive policy must not silently collapse the latter to a
+    four-dimensional all-zero ROUGE vector.
+    """
+    weights = summary.get("objective_weights")
+    if isinstance(weights, dict) and weights:
+        keys = tuple(f"mean_{name}" for name in weights
+                     if f"mean_{name}" in summary)
+        if keys:
+            return keys
+    return tuple(key for key in QUALITY_KEYS if key in summary) or QUALITY_KEYS
+
+
 def weighted_score(summary: dict[str, Any]) -> float:
     """Use the same scalar objective as the v3 evaluator, with replay fallback."""
     if "weighted_score" in summary:
         return float(summary.get("weighted_score", 0.0))
+    weights = summary.get("objective_weights")
+    if isinstance(weights, dict) and weights:
+        return sum(float(weight) * float(summary.get(f"mean_{name}", 0.0))
+                   for name, weight in weights.items())
     return (
         0.25 * float(summary.get("mean_rouge1", 0.0))
         + 0.35 * float(summary.get("mean_rougeL", 0.0))
@@ -38,12 +58,16 @@ def weighted_score(summary: dict[str, Any]) -> float:
 
 
 def quality_vector(summary: dict[str, Any]) -> tuple[float, ...]:
-    return tuple(float(summary.get(key, 0.0)) for key in QUALITY_KEYS)
+    return tuple(float(summary.get(key, 0.0)) for key in metric_keys(summary))
 
 
 def dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
     """Whether left is no worse in every quality metric and better in one."""
-    a, b = quality_vector(left), quality_vector(right)
+    keys = metric_keys(left)
+    if set(keys) != set(metric_keys(right)):
+        return False
+    a = tuple(float(left.get(key, 0)) for key in keys)
+    b = tuple(float(right.get(key, 0)) for key in keys)
     return all(x >= y for x, y in zip(a, b)) and any(x > y for x, y in zip(a, b))
 
 
@@ -109,7 +133,13 @@ def _safe_summary(event: dict[str, Any]) -> dict[str, Any]:
         "mean_bleu", "mean_meteor", "mean_title_coverage", "mean_qa_calls",
         "weighted_score", "weighted_score_100", "objective_protocol", "objective_weights",
     )
-    return {key: event[key] for key in keys if key in event}
+    result = {key: event[key] for key in keys if key in event}
+    # Candidate events flatten the adapter summary.  Carry task-specific
+    # mean_* fields into archive nodes so metric_keys() can see them.
+    for key, value in event.items():
+        if key.startswith("mean_") and isinstance(value, (int, float)):
+            result[key] = value
+    return result
 
 
 def _node_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -185,6 +215,7 @@ def select_parent_branches(
     island_count: int,
     iteration: int,
     operation: str,
+    incumbent_slots: int | None = None,
 ) -> list[tuple[dict[str, Any], int]]:
     """Select diverse parent nodes and allocate exactly ``branch_count`` slots.
 
@@ -206,7 +237,7 @@ def select_parent_branches(
         archive,
         key=lambda event: (
             weighted_score(_safe_summary(event)),
-            float(event.get("mean_rougeL", 0.0)),
+            max((float(event.get(key, 0.0)) for key in metric_keys(_safe_summary(event))), default=0.0),
         ),
         reverse=True,
     )[:limit]
@@ -229,8 +260,14 @@ def select_parent_branches(
     # Protect the best scalar solution and the current Pareto front.  The
     # remainder is available for structural/island exploration.
     front = pareto_front(nodes)
-    elite = max(nodes, key=lambda n: (weighted_score(n["summary"]),
-                                      float(n["summary"].get("mean_rougeL", 0.0))))
+    def max_metric_value(node: dict[str, Any]) -> float:
+        summary = node["summary"]
+        return max(
+            (float(summary.get(key, 0.0)) for key in metric_keys(summary)),
+            default=0.0,
+        )
+
+    elite = max(nodes, key=lambda n: (weighted_score(n["summary"]), max_metric_value(n)))
     candidates = _deduplicate([elite, incumbent_node, *front, *nodes])
     selected: list[dict[str, Any]] = []
 
@@ -275,7 +312,7 @@ def select_parent_branches(
         explorers = explorers[offset:] + explorers[:offset]
 
     total = max(1, int(branch_count))
-    incumbent_slots = max(1, (total + 1) // 2)
+    incumbent_slots = max(1, (total + 1) // 2) if incumbent_slots is None else max(1, incumbent_slots)
     incumbent_slots = min(total, incumbent_slots)
     exploration_slots = total - incumbent_slots
     allocations = [[incumbent_node, incumbent_slots]]

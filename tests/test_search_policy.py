@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.search_policy import dominates, pareto_front, select_parent_branches
+from scripts.search_policy import dominates, metric_keys, pareto_front, select_parent_branches
 
 
 def summary(r1, rl, bleu, meteor):
@@ -17,6 +17,18 @@ def summary(r1, rl, bleu, meteor):
 
 
 class SearchPolicyTest(unittest.TestCase):
+    def test_task_specific_objective_dimensions_are_visible(self):
+        left = {
+            'objective_weights': {'accuracy': .75, 'label_f1': .25},
+            'mean_accuracy': .9, 'mean_label_f1': .3,
+        }
+        right = {
+            'objective_weights': {'accuracy': .75, 'label_f1': .25},
+            'mean_accuracy': .8, 'mean_label_f1': .2,
+        }
+        self.assertEqual(metric_keys(left), ('mean_accuracy', 'mean_label_f1'))
+        self.assertTrue(dominates(left, right))
+
     def test_pareto_front_keeps_complementary_candidates(self):
         strong_rl = {'summary': summary(.3, .9, .3, .3)}
         strong_bleu = {'summary': summary(.3, .3, .9, .3)}

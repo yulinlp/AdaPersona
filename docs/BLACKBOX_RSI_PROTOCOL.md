@@ -20,6 +20,9 @@ The outer Code Agent edits complete Python source. It is not available inside
 the runtime harness. The default answer model is Qwen2.5-7B-Instruct, but the
 runner accepts an arbitrary served QA model through `--qa-model`; this supports
 the Qwen3.8/Qwen3.8 comparison without changing the interface.
+The runtime QA broker clamps generation to deterministic temperature `0`,
+`top_p=1`, `top_k=1`, and seed `0`; stochasticity belongs to the outer
+evolution agent, not official harness scoring.
 
 ## Search
 
@@ -52,6 +55,15 @@ training. Its historical profile is split into leave-one-out pseudo tasks:
 The pseudo references are historical profile abstracts. They are allowed
 profile evidence, not the official test target. The final scorer uses the
 official test target only outside the harness to calculate metrics.
+
+The same profile-only adapter supports the original LaMP user split for tasks
+2, 3, 4, and 5 only. LaMP-2 uses exact label accuracy plus label overlap;
+LaMP-3 uses exact rating accuracy plus rating closeness; LaMP-4 and LaMP-5
+reuse the text-overlap objective above. LaMP-QA and LaMP-1/6/7 are outside
+this protocol. See `scripts/lamp_tasks.py` and
+`scripts/evaluate_lamp_test.py`.
+For per-round visibility, `scripts/monitor_lamp_test.py` is a separate
+side-channel scorer; it cannot affect acceptance or Code Agent prompts.
 
 ## Runtime isolation
 

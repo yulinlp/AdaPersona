@@ -90,6 +90,22 @@ def run(row, qa):
         with self.assertRaisesRegex(RuntimeError, 'embedding budget'):
             qa.embed(['x']*4097)
 
+    def test_runtime_answer_generation_is_deterministic(self):
+        calls = []
+
+        class RecordingClient:
+            def generate_batch(self, prompts, **kwargs):
+                calls.append(kwargs)
+                return ['answer'] * len(prompts)
+
+        qa = VLLMQA(RecordingClient())
+        qa.generate('task', temperature=.8, top_p=.2)
+        qa.generate_many(['task-a', 'task-b'], temperature=.8, top_p=.2)
+        self.assertEqual(calls[0]['temperature'], 0.0)
+        self.assertEqual(calls[0]['top_p'], 1.0)
+        self.assertEqual(calls[1]['temperature'], 0.0)
+        self.assertEqual(calls[1]['top_p'], 1.0)
+
 
 class V2FeedbackTest(unittest.TestCase):
     def test_gold_available_only_in_training_feedback_and_old_steps_represented(self):
@@ -168,6 +184,17 @@ class V2FeedbackTest(unittest.TestCase):
         code='def run(row, qa):\n    return '+repr(target)
         self.assertIsNotNone(evo.reference_literal_leak(code,[{'target':target}]))
 
+    def test_short_label_tasks_reject_input_and_sample_lookup(self):
+        row = {
+            'input': 'A long current task description with enough content to identify one exact training sample. ' * 2,
+            'sample_id': 'profile_adaptation:lamp2:120:1200',
+            'target': 'healthy living',
+        }
+        input_code = 'def run(row, qa):\n    return '+repr(row['input'])
+        sample_code = 'def run(row, qa):\n    return '+repr(row['sample_id'])
+        self.assertIn('input lookup', evo.reference_literal_leak(input_code, [row]))
+        self.assertIn('sample_id lookup', evo.reference_literal_leak(sample_code, [row]))
+
     def test_one_request_failure_does_not_drop_other_branch(self):
         with tempfile.TemporaryDirectory() as tmp:
             bank = evo.FailureBank(Path(tmp)/'bank.jsonl')
@@ -241,13 +268,43 @@ class V2FeedbackTest(unittest.TestCase):
             prediction = 'alpha' if code==macro else 'alpha beta gamma' if code==repair else 'alpha beta'
             return [dict(r, prediction=prediction, error='', qa_calls=1) for r in rows]
         with tempfile.TemporaryDirectory() as tmp:
-            args=argparse.Namespace(output_dir=Path(tmp), iterations=1, branches=4, agent_url='unused')
+            args=argparse.Namespace(output_dir=Path(tmp), iterations=2, branches=3, agent_url='unused')
             rows=[dict(user_id='u', sample_id='s', input='task', target='alpha beta gamma', profile=[])]
-            with patch.object(evo,'propose_candidates',side_effect=propose), patch.object(evo,'evaluate_code',side_effect=evaluate):
+            choices = [{'operation': op, 'reason': 'adaptation evidence'} for op in evo.OPERATION_NAMES]
+            with patch.object(evo,'choose_operation',side_effect=choices), patch.object(evo,'propose_candidates',side_effect=propose), patch.object(evo,'evaluate_code',side_effect=evaluate):
                 state=per.evolve_user('u',rows,args,None,threading.Semaphore(),'',lambda r:None)
+            self.assertEqual(state['completed_operations'], 2)
             self.assertIn(macro, observed_parents)
             self.assertEqual(state['summary']['mean_rougeL'], 1)
             self.assertEqual(Path(state['code_path']).read_text(), repair)
+
+    def test_operation_choice_is_data_only(self):
+        for operation in evo.OPERATION_NAMES:
+            self.assertEqual(evo.parse_operation_choice(
+                f'operation = "{operation}"\nreason = "historical errors"')['operation'], operation)
+        for text in ('operation = "both"\nreason = "x"',
+                     'operation = "micro_repair"',
+                     'import os\noperation = "macro_strategy"\nreason = "x"'):
+            with self.assertRaises(ValueError):
+                evo.parse_operation_choice(text)
+
+    def test_rounds_can_repeat_operation_and_resume_without_more_work(self):
+        calls = []
+        def propose(**kwargs):
+            calls.append((kwargs['iteration'], kwargs['operation'], kwargs['count']))
+            return [{'valid': True, 'code': kwargs['parent_code']} for _ in range(kwargs['count'])]
+        def evaluate(code, rows, qa, **kwargs):
+            return [dict(r, prediction='alpha beta', error='', qa_calls=1) for r in rows]
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(output_dir=Path(tmp), iterations=2, branches=3, agent_url='unused')
+            rows = [dict(user_id='u', sample_id='s', input='task', target='alpha beta', profile=[])]
+            with patch.object(evo, 'choose_operation', return_value={'operation': 'micro_repair', 'reason': 'errors'}) as choose, patch.object(evo, 'propose_candidates', side_effect=propose), patch.object(evo, 'evaluate_code', side_effect=evaluate):
+                state = per.evolve_user('u', rows, args, None, threading.Semaphore(), '', lambda r: None)
+                self.assertEqual(state['completed_operations'], 2)
+                self.assertEqual(calls, [(1, 'micro_repair', 3), (2, 'micro_repair', 3)])
+                per.evolve_user('u', rows, args, None, threading.Semaphore(), '', lambda r: None)
+                self.assertEqual(choose.call_count, 2)
+                self.assertEqual(len(calls), 2)
 
 
 class V2EmbeddingTest(unittest.TestCase):

@@ -17,10 +17,12 @@ try:
     from . import code_evolution as evo
     from .embedding_client import EmbeddingClient
     from .search_policy import select_parent_branches
+    from .lamp_tasks import LampTaskAdapter
 except ImportError:
     import code_evolution as evo
     from embedding_client import EmbeddingClient
     from search_policy import select_parent_branches
+    from lamp_tasks import LampTaskAdapter
 
 
 def atomic_json(path, value):
@@ -50,24 +52,78 @@ def wins(child, parent):
 PROTOCOL = 'per-user-code-v3-weighted'
 
 
+class LongLaMPAdapter:
+    """Compatibility adapter preserving the existing LongLaMP protocol."""
+
+    benchmark = 'LongLaMP'
+    task = 'abstract_generation'
+    name = 'longlamp_abstract'
+    seed_code = evo.SEED_HARNESS_CODE
+    metric_names = ('rouge1', 'rouge2', 'rougeL', 'bleu', 'meteor')
+    metric_protocol = evo.METRIC_PROTOCOL
+    objective_protocol = evo.OBJECTIVE_PROTOCOL
+    objective_weights = evo.OBJECTIVE_WEIGHTS
+    task_context = (
+        'Benchmark: LongLaMP abstract generation. The harness receives a current abstract task '
+        'and historical title/abstract dictionaries and must return only the current abstract.'
+    )
+    objective_description = (
+        "maximize this user's weighted training score (0-100): "
+        '0.25*ROUGE-1 + 0.35*ROUGE-L + 0.20*BLEU + 0.20*METEOR'
+    )
+    evaluation_boundary = ('Only historical-profile leave-one-out tasks are used for adaptation. '
+                          'The current official test input, target and monitoring scores are unavailable to the evolver.')
+
+    def preflight(self):
+        module = importlib.import_module(evo.row_metrics.__module__)
+        return module.preflight()
+
+    def summarize_rows(self, rows, trace_limit=20):
+        return evo.summarize_rows(rows, trace_limit=trace_limit)
+
+    def build_failure_entries(self, parent_rows, child_rows, **kwargs):
+        return evo.build_failure_entries(parent_rows, child_rows, **kwargs)
+
+    def weighted_score(self, summary):
+        return evo.weighted_score(summary)
+
+    def score_key(self, summary):
+        return evo.score_key(summary)
+
+    def wins(self, child, parent):
+        return wins(child, parent)
+
+
+def adapter_for(args):
+    if getattr(args, 'benchmark', 'longlamp') == 'lamp':
+        return LampTaskAdapter(int(getattr(args, 'task', 4)))
+    return LongLaMPAdapter()
+
+
 def protocol_for(args):
     """Give the tree-search run a distinct, auditable protocol label."""
     agent_model = getattr(args, 'agent_model', 'Qwen/Qwen3.8-27B')
     qa_model = getattr(args, 'qa_model', 'Qwen2.5-7B-Instruct')
     agent_tag = agent_model.replace('/', '_').replace('-', '_')
     qa_tag = qa_model.replace('/', '_').replace('-', '_')
+    benchmark = getattr(args, 'benchmark', 'longlamp')
+    task = getattr(args, 'task', 'abstract_generation')
+    prefix = f'{benchmark}-{task}-adaptive-single-operation-v1'
     if getattr(args, 'search_strategy', 'greedy') == 'archive_beam':
-        return f'per-user-code-v5-archive-beam-planned-smoke-weighted-agent-{agent_tag}-qa-{qa_tag}'
-    return f'{PROTOCOL}-agent-{agent_tag}-qa-{qa_tag}'
+        return f'{prefix}-per-user-code-v5-archive-beam-planned-smoke-weighted-agent-{agent_tag}-qa-{qa_tag}'
+    return f'{prefix}-{PROTOCOL}-agent-{agent_tag}-qa-{qa_tag}'
 
 
 def tools_reference(packages):
     return evo.load_strategy_library() + '\nInstalled optional package versions: ' + json.dumps(packages)
 
 
-def evolve_user(user_id, rows, args, qa, gate, library, report):
+def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
+    adapter = adapter or adapter_for(args)
     if not rows or {str(r['user_id']) for r in rows} != {user_id}:
         raise ValueError('User isolation violation')
+    if not 1 <= args.branches <= 3:
+        raise ValueError('Each round supports at most three candidates')
     directory = args.output_dir / 'users' / user_key(user_id)
     protocol = protocol_for(args)
     agent_model = getattr(args, 'agent_model', 'Qwen/Qwen3.8-27B')
@@ -82,14 +138,17 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
     archive = evo.load_jsonl(archive_path) if archive_path.exists() else []
     dataset_hash = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
     config_hash = hashlib.sha256(json.dumps({
-        'protocol': protocol, 'metrics': evo.METRIC_PROTOCOL,
-        'objective_protocol': evo.OBJECTIVE_PROTOCOL,
-        'objective_weights': evo.OBJECTIVE_WEIGHTS, 'dataset': dataset_hash,
+        'protocol': protocol, 'benchmark': getattr(args, 'benchmark', 'longlamp'),
+        'task': getattr(args, 'task', 'abstract_generation'),
+        'metrics': adapter.metric_protocol,
+        'objective_protocol': adapter.objective_protocol,
+        'objective_weights': adapter.objective_weights, 'dataset': dataset_hash,
         'iterations': args.iterations, 'branches': args.branches,
         'search_strategy': getattr(args, 'search_strategy', 'greedy'),
         'beam_width': getattr(args, 'beam_width', 1),
         'archive_size': getattr(args, 'archive_size', 0),
         'island_count': getattr(args, 'island_count', 1),
+        'incumbent_slots': getattr(args, 'incumbent_slots', 1),
         'qa_url': getattr(args, 'qa_url', ''), 'agent_url': args.agent_url,
         'agent_model': getattr(args, 'agent_model', 'Qwen/Qwen3.8-27B'),
         'qa_model': qa_model,
@@ -120,50 +179,87 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
         if state.get('config_hash') != config_hash or state['user_id'] != user_id:
             raise ValueError('Resume protocol/data/config/source differs; use a fresh output directory')
     else:
-        code = evo.SEED_HARNESS_CODE
+        code = adapter.seed_code
         predictions = evaluate(code, 'seed')
-        baseline = evo.summarize_rows(predictions, trace_limit=len(rows))
+        baseline = adapter.summarize_rows(predictions, trace_limit=len(rows))
         if baseline['errors']:
             raise RuntimeError('Seed evaluation failed; do not optimize against a broken baseline')
         evo.save_code(directory / 'seed.py', code)
         evo.write_jsonl(directory / 'seed_predictions.jsonl', predictions)
-        bank.add(evo.build_failure_entries([], predictions, iteration=0, operation='seed',
-                                          candidate_id='seed', max_entries=len(rows)))
-        state = dict(protocol=protocol, config_hash=config_hash, dataset_hash=dataset_hash,
+        bank.add(adapter.build_failure_entries([], predictions, iteration=0, operation='seed',
+                                              candidate_id='seed', max_entries=len(rows)))
+        state = dict(protocol=protocol, benchmark=getattr(args, 'benchmark', 'longlamp'),
+                     task=getattr(args, 'task', 'abstract_generation'), config_hash=config_hash, dataset_hash=dataset_hash,
                      user_id=user_id, baseline=baseline, summary=baseline,
                      completed_operations=0, exploration=None,
                      code_path=str(directory/'seed.py'),
                      predictions_path=str(directory/'seed_predictions.jsonl'))
         atomic_json(state_path, state)
 
+    # State and its completion event form a recoverable commit: the event is
+    # embedded in the atomic state before publication to the monitor journal.
+    if state.get('last_operation_event'):
+        save_event(state['last_operation_event'])
+
     def read_branch(branch):
         return Path(branch['code_path']).read_text(), evo.load_jsonl(Path(branch['predictions_path'])), branch['summary']
 
     def publish(phase):
         summary, baseline = state['summary'], state['baseline']
-        report(dict(user_id=user_id, phase=phase, samples=len(rows),
-                    completed_operations=state['completed_operations'],
-                    baseline_weighted_score_100=baseline['weighted_score_100'],
-                    current_weighted_score_100=summary['weighted_score_100'],
-                    gain_weighted_points=round(100*(summary['weighted_score']-baseline['weighted_score']), 3),
-                    baseline_rougeL_100=baseline['mean_rougeL_100'],
-                    current_rougeL_100=summary['mean_rougeL_100'],
-                    gain_rougeL_points=round(100*(summary['mean_rougeL']-baseline['mean_rougeL']), 3),
-                    rouge1_100=summary['mean_rouge1_100'], rougeL_100=summary['mean_rougeL_100'],
-                    bleu_100=summary['mean_bleu_100'], meteor_100=summary['mean_meteor_100'],
-                    metric_protocol=evo.METRIC_PROTOCOL,
-                    objective_protocol=evo.OBJECTIVE_PROTOCOL,
-                    objective_weights=evo.OBJECTIVE_WEIGHTS,
-                    harness=state['code_path']))
+        record = dict(user_id=user_id, phase=phase, samples=len(rows),
+                      completed_operations=state['completed_operations'],
+                      benchmark=getattr(args, 'benchmark', 'longlamp'),
+                      task=getattr(args, 'task', 'abstract_generation'),
+                      baseline_weighted_score_100=baseline['weighted_score_100'],
+                      current_weighted_score_100=summary['weighted_score_100'],
+                      gain_weighted_points=round(100*(summary['weighted_score']-baseline['weighted_score']), 3),
+                      metric_protocol=summary.get('metric_protocol'),
+                      objective_protocol=summary.get('objective_protocol'),
+                      objective_weights=summary.get('objective_weights'),
+                      harness=state['code_path'])
+        for metric in adapter.metric_names:
+            record[f'baseline_{metric}_100'] = baseline.get(f'mean_{metric}_100', 0.0)
+            record[f'current_{metric}_100'] = summary.get(f'mean_{metric}_100', 0.0)
+            record[f'gain_{metric}_points'] = round(100 * (
+                summary.get(f'mean_{metric}', 0.0) - baseline.get(f'mean_{metric}', 0.0)), 3)
+        # Preserve the legacy names consumed by existing LongLaMP monitors.
+        if 'mean_rougeL' in summary:
+            record.update(
+                baseline_rougeL_100=baseline.get('mean_rougeL_100', 0.0),
+                current_rougeL_100=summary.get('mean_rougeL_100', 0.0),
+                gain_rougeL_points=round(100 * (summary.get('mean_rougeL', 0.0) - baseline.get('mean_rougeL', 0.0)), 3),
+                rouge1_100=summary.get('mean_rouge1_100', 0.0),
+                rougeL_100=summary.get('mean_rougeL_100', 0.0),
+                bleu_100=summary.get('mean_bleu_100', 0.0),
+                meteor_100=summary.get('mean_meteor_100', 0.0),
+            )
+        report(record)
     publish('baseline_ready')
     user_library = library + (
         '\nIndependent harness evolution for ONE isolated training user. '
         'No global user router or meta-policy. Specialize using this user\'s historical evidence. '
-        'References are TRAINING diagnostics, never runtime inputs or hardcoded answers.')
+        'References are TRAINING diagnostics, never runtime inputs or hardcoded answers.\n' +
+        adapter.task_context)
 
-    for op_index in range(state['completed_operations'], args.iterations*2):
-        iteration, operation = op_index//2+1, evo.OPERATION_NAMES[op_index % 2]
+    for op_index in range(state['completed_operations'], args.iterations):
+        iteration = op_index + 1
         code, predictions, summary = read_branch(state)
+        decision_path = directory / f'i{iteration:02d}_operation_choice.json'
+        if decision_path.exists():
+            decision = json.loads(decision_path.read_text())
+        else:
+            publish(f'choosing_operation:{iteration}')
+            decision = evo.choose_operation(
+                parent_code=code, iteration=iteration, current_summary=summary,
+                failure_bank=bank, history=history, archive=archive,
+                task_context=adapter.task_context, agent_api_url=args.agent_url,
+                agent_api_model=agent_model, agent_timeout=agent_timeout,
+                request_gate=gate, artifact_dir=directory/f'i{iteration:02d}_selection_requests')
+            atomic_json(decision_path, decision)
+        operation = decision['operation']
+        if operation not in evo.OPERATION_NAMES:
+            raise ValueError('Invalid persisted operation decision')
+        operation_library = user_library + '\nChosen operation rationale: ' + decision['reason']
         incumbent = dict(code_path=state['code_path'], predictions_path=state['predictions_path'], summary=summary)
         if getattr(args, 'search_strategy', 'greedy') == 'archive_beam':
             # Every evaluated candidate remains a possible parent.  The
@@ -175,6 +271,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
                 archive_size=getattr(args, 'archive_size', 64),
                 island_count=getattr(args, 'island_count', 4),
                 iteration=iteration, operation=operation,
+                incumbent_slots=getattr(args, 'incumbent_slots', 1),
             )
         else:
             groups = [(incumbent, args.branches)]
@@ -201,11 +298,14 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
                     parent_code=code, operation=operation, iteration=iteration,
                     count=args.branches, current_summary=summary,
                     failure_bank=bank, history=history, archive=archive,
-                    strategy_library=user_library, agent_api_url=args.agent_url,
+                    strategy_library=operation_library, agent_api_url=args.agent_url,
                     agent_api_model=agent_model, agent_timeout=agent_timeout,
                     agent_retries=2, agent_retry_wait=2, agent_max_tokens=None,
                     request_gate=gate, artifact_dir=op_dir/'agent_requests',
-                    runtime_model=qa_model, runtime_context=qa_context)
+                    runtime_model=qa_model, runtime_context=qa_context,
+                    task_context=adapter.task_context,
+                    objective_description=adapter.objective_description,
+                    evaluation_boundary=adapter.evaluation_boundary)
             proposals = []
             proposal_offset = 0
             for branch_parent, count in groups:
@@ -215,11 +315,14 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
                 proposal_kwargs = dict(
                     parent_code=pcode, operation=operation, iteration=iteration, count=count,
                     current_summary=psummary, failure_bank=bank, history=history, archive=archive,
-                    strategy_library=user_library, agent_api_url=args.agent_url,
+                    strategy_library=operation_library, agent_api_url=args.agent_url,
                     agent_api_model=agent_model, agent_timeout=agent_timeout, agent_retries=2,
                     agent_retry_wait=2, agent_concurrency=count, agent_max_tokens=None,
                     request_gate=gate, artifact_dir=op_dir/'agent_requests',
-                    runtime_model=qa_model, runtime_context=qa_context)
+                    runtime_model=qa_model, runtime_context=qa_context,
+                    task_context=adapter.task_context,
+                    objective_description=adapter.objective_description,
+                    evaluation_boundary=adapter.evaluation_boundary)
                 if planned_hypotheses is not None:
                     proposal_kwargs['planned_hypotheses'] = planned_hypotheses[
                         proposal_offset:proposal_offset + count]
@@ -231,6 +334,9 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
             if proposals and all(p.get('failure_kind') == 'service_request' for p in proposals):
                 raise RuntimeError('All evolver requests failed; operation not advanced: ' + str(proposals[0].get('error')))
             atomic_json(proposals_path, proposals)
+
+        if len(proposals) > args.branches:
+            raise ValueError('Persisted/generated proposal count exceeds round budget')
 
         evaluated = []
         seen = {evo.behavior_fingerprint(code)}
@@ -269,7 +375,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
             # a transient vLLM failure is not mistaken for a bad harness.
             smoke_rows = rows[:1]
             smoke_predictions = evaluate(proposal['code'], cid + ':smoke', smoke_rows)
-            smoke_summary = evo.summarize_rows(smoke_predictions, trace_limit=len(smoke_rows))
+            smoke_summary = adapter.summarize_rows(smoke_predictions, trace_limit=len(smoke_rows))
             evo.write_jsonl(directory/(cid+'_smoke_predictions.jsonl'), smoke_predictions)
             atomic_json(directory/(cid+'_smoke_evaluation.json'), smoke_summary)
             smoke_errors = [str(item.get('error', '')) for item in smoke_predictions if item.get('error')]
@@ -289,7 +395,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
                     smoke_errors=smoke_errors,
                     smoke_weighted_score_100=smoke_summary['weighted_score_100'],
                 )
-                bank.add(evo.build_failure_entries(
+                bank.add(adapter.build_failure_entries(
                     parent_rows, smoke_predictions, iteration=iteration,
                     operation=operation, candidate_id=cid, max_entries=len(smoke_rows)))
                 atomic_json(directory/(cid+'_smoke_failed.json'), {
@@ -303,19 +409,21 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
                 child_rows = evo.load_jsonl(pred_path)
             else:
                 child_rows = evaluate(proposal['code'], cid)
-                child_summary = evo.summarize_rows(child_rows, trace_limit=len(rows))
+                child_summary = adapter.summarize_rows(child_rows, trace_limit=len(rows))
                 evo.write_jsonl(pred_path, child_rows)
                 atomic_json(cached_path, child_summary)
-            bank.add(evo.build_failure_entries(parent_rows, child_rows, iteration=iteration,
-                                              operation=operation, candidate_id=cid, max_entries=len(rows)))
+            bank.add(adapter.build_failure_entries(parent_rows, child_rows, iteration=iteration,
+                                                  operation=operation, candidate_id=cid, max_entries=len(rows)))
             event.update(event='candidate_evaluated', code_path=str(path), predictions_path=str(pred_path),
-                         parent_rougeL=parent_summary['mean_rougeL'], child_rougeL=child_summary['mean_rougeL'],
-                         delta_rougeL=child_summary['mean_rougeL']-parent_summary['mean_rougeL'],
                          parent_weighted_score=parent_summary['weighted_score'],
                          child_weighted_score=child_summary['weighted_score'],
                          delta_weighted_score=child_summary['weighted_score']-parent_summary['weighted_score'],
                          delta_weighted_points=round(100*(child_summary['weighted_score']-parent_summary['weighted_score']), 3),
                          **{k:v for k,v in child_summary.items() if k != 'worst_traces'})
+            for metric in adapter.metric_names:
+                event[f'parent_{metric}'] = parent_summary.get(f'mean_{metric}', 0.0)
+                event[f'child_{metric}'] = child_summary.get(f'mean_{metric}', 0.0)
+                event[f'delta_{metric}'] = child_summary.get(f'mean_{metric}', 0.0) - parent_summary.get(f'mean_{metric}', 0.0)
             archive[:] = [r for r in archive if r['candidate_id'] != cid]
             archive.append(event.copy())
             evo.write_jsonl(archive_path, archive)
@@ -327,14 +435,10 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
         accepted_id = None
         ranked = sorted(evaluated, key=lambda b: (
             b['summary']['errors'],
-            -evo.weighted_score(b['summary']),
-            -b['summary']['mean_rougeL'],
-            -b['summary']['mean_rouge1'],
-            -b['summary']['mean_bleu'],
-            -b['summary']['mean_meteor'],
+            tuple(-value for value in adapter.score_key(b['summary'])),
         ))
         for candidate in ranked:
-            if not wins(candidate['summary'], summary):
+            if not adapter.wins(candidate['summary'], summary):
                 continue
             publish('confirming:' + candidate['candidate_id'])
             ccode, _, _ = read_branch(candidate)
@@ -344,22 +448,24 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
             else:
                 confirmed = evaluate(ccode, candidate['candidate_id']+':confirm')
                 parent_repeat = evaluate(code, candidate['candidate_id']+':parent_recheck')
-                confirmation = dict(candidate=evo.summarize_rows(confirmed, trace_limit=len(rows)),
-                                    parent=evo.summarize_rows(parent_repeat, trace_limit=len(rows)))
+                confirmation = dict(candidate=adapter.summarize_rows(confirmed, trace_limit=len(rows)),
+                                    parent=adapter.summarize_rows(parent_repeat, trace_limit=len(rows)))
                 evo.write_jsonl(directory/(candidate['candidate_id']+'_confirmed_predictions.jsonl'), confirmed)
                 evo.write_jsonl(directory/(candidate['candidate_id']+'_parent_recheck.jsonl'), parent_repeat)
                 atomic_json(cpath, confirmation)
             repeat_summary = confirmation['candidate']
             # Same training data, fresh executions; not a claim of statistical significance.
-            accepted = not confirmation['parent']['errors'] and wins(repeat_summary, summary) and wins(repeat_summary, confirmation['parent'])
-            save_event(dict(event='confirmation', user_id=user_id, iteration=iteration, operation=operation,
-                            candidate_id=candidate['candidate_id'], accepted=accepted,
-                            child_rougeL=repeat_summary['mean_rougeL'],
-                            parent_rougeL=confirmation['parent']['mean_rougeL'],
-                            child_weighted_score=repeat_summary['weighted_score'],
-                            parent_weighted_score=confirmation['parent']['weighted_score'],
-                            delta_weighted_points=round(100*(repeat_summary['weighted_score']-
-                                                             confirmation['parent']['weighted_score']), 3)))
+            accepted = not confirmation['parent']['errors'] and adapter.wins(repeat_summary, summary) and adapter.wins(repeat_summary, confirmation['parent'])
+            confirmation_event = dict(event='confirmation', user_id=user_id, iteration=iteration, operation=operation,
+                                      candidate_id=candidate['candidate_id'], accepted=accepted,
+                                      child_weighted_score=repeat_summary['weighted_score'],
+                                      parent_weighted_score=confirmation['parent']['weighted_score'],
+                                      delta_weighted_points=round(100*(repeat_summary['weighted_score']-
+                                                                       confirmation['parent']['weighted_score']), 3))
+            for metric in adapter.metric_names:
+                confirmation_event[f'child_{metric}'] = repeat_summary.get(f'mean_{metric}', 0.0)
+                confirmation_event[f'parent_{metric}'] = confirmation['parent'].get(f'mean_{metric}', 0.0)
+            save_event(confirmation_event)
             if accepted:
                 accepted_id = candidate['candidate_id']
                 state.update(code_path=candidate['code_path'],
@@ -371,19 +477,25 @@ def evolve_user(user_id, rows, args, qa, gate, library, report):
                 item['accepted'] = True
         evo.write_jsonl(archive_path, archive)
         if operation == 'macro_strategy':
-            # At most one new branch receives a repair chance in this iteration.
+            # Retain an alternative for a later round if repair is chosen.
             alternatives = [b for b in ranked if b['candidate_id'] != accepted_id]
             state['exploration'] = alternatives[0] if alternatives else None
         else:
             state['exploration'] = None
         state['completed_operations'] = op_index+1
+        operation_event = dict(user_id=user_id, event='operation_complete', iteration=iteration, operation=operation,
+                              accepted_candidate=accepted_id,
+                              weighted_score_100=state['summary']['weighted_score_100'],
+                              exploration_parent=(state.get('exploration') or {}).get('code_path'),
+                              code_path=state['code_path'], operation_reason=decision['reason'])
+        for metric in adapter.metric_names:
+            operation_event[f'{metric}_100'] = state['summary'].get(f'mean_{metric}_100', 0.0)
+        if 'mean_rougeL_100' in state['summary']:
+            operation_event['rougeL_100'] = state['summary']['mean_rougeL_100']
+        state['last_operation_event'] = operation_event
         atomic_json(state_path, state)
         evo.save_code(directory/'current_harness.py', Path(state['code_path']).read_text())
-        save_event(dict(user_id=user_id, event='operation_complete', iteration=iteration, operation=operation,
-                        accepted_candidate=accepted_id,
-                        weighted_score_100=state['summary']['weighted_score_100'],
-                        rougeL_100=state['summary']['mean_rougeL_100'],
-                        exploration_parent=(state.get('exploration') or {}).get('code_path')))
+        save_event(operation_event)
         publish('operation_complete')
     publish('complete')
     return state
@@ -419,14 +531,20 @@ def wait_for_evolver(url, output_dir, model_id):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--benchmark', choices=('longlamp', 'lamp'), default='longlamp')
+    parser.add_argument('--task', type=int, choices=(2, 3, 4, 5),
+                        help='LaMP task; required when --benchmark lamp')
     parser.add_argument('--train', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--iterations', type=int, default=6)
-    parser.add_argument('--branches', type=int, default=4)
+    parser.add_argument('--iterations', type=int, default=10,
+                        help='Number of rounds; one agent-chosen operation per round')
+    parser.add_argument('--branches', type=int, choices=(1, 2, 3), default=3)
     parser.add_argument('--search-strategy', choices=('greedy', 'archive_beam'), default='greedy')
     parser.add_argument('--beam-width', type=int, default=4)
     parser.add_argument('--archive-size', type=int, default=64)
     parser.add_argument('--island-count', type=int, default=4)
+    parser.add_argument('--incumbent-slots', type=int, default=1,
+                        help='Reserve this many candidates for incumbent; remaining slots explore archive')
     parser.add_argument('--user-workers', type=int, default=4)
     parser.add_argument('--agent-concurrency', type=int, default=8)
     parser.add_argument('--max-users', type=int)
@@ -440,6 +558,15 @@ def main():
     parser.add_argument('--embedding-url', default='http://gpu01:18013/v1')
     parser.add_argument('--embedding-backend', choices=('vllm', 'cpu'), default='vllm')
     args = parser.parse_args()
+    if args.agent_model != 'Qwen/Qwen3.8-27B':
+        parser.error('Code Agent must be Qwen/Qwen3.8-27B')
+    if not 1 <= args.incumbent_slots <= args.branches:
+        parser.error('incumbent-slots must be between 1 and branches')
+    if args.benchmark == 'lamp' and args.task is None:
+        parser.error('--task is required when --benchmark lamp')
+    if args.benchmark == 'longlamp':
+        args.task = 'abstract_generation'
+    adapter = adapter_for(args)
     if min(args.iterations, args.branches, args.beam_width, args.archive_size,
            args.island_count, args.user_workers, args.agent_concurrency) < 1:
         parser.error('iterations/branches/search widths/concurrency must be positive')
@@ -447,14 +574,13 @@ def main():
     run_lock = (args.output_dir/'runner.lock').open('a+')
     fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     atomic_json(args.output_dir/'runner.json', {'pid': os.getpid(), 'started': time.time()})
-    from importlib import import_module
-    metric_module = import_module(evo.row_metrics.__module__)
-    metric_config = metric_module.preflight()
+    metric_config = adapter.preflight()
     root = Path(__file__).resolve().parents[1]
     source_files = [root/'scripts'/name for name in (
         'evolve_per_user.py', 'code_evolution.py', 'blackbox_harness.py', 'longlamp_rsi.py',
         'isolated_runtime.py', 'harness_worker.py', 'embedding_client.py', 'evolution_metrics.py',
-        'search_policy.py',
+        'search_policy.py', 'lamp_tasks.py', 'evaluate_lamp_test.py',
+        'prepare_lamp_user_tta.sh', 'run_lamp_evo.sh',
         'run_per_user_evo.sh')] + [root/'docs'/'BLACKBOX_STRATEGY_LIBRARY.md']
     args.source_hash = hashlib.sha256(b''.join(p.read_bytes() for p in source_files)).hexdigest()
     previous_config = args.output_dir/'run_config.json'
@@ -507,7 +633,7 @@ def main():
             if record['phase'] not in ('failed', 'retry_wait'):
                 records[record['user_id']].pop('error', None)
             atomic_json(args.output_dir / 'user_scores.json', records)
-            gains = [r['gain_rougeL_points'] for r in records.values() if 'gain_rougeL_points' in r]
+            gains = [r['gain_weighted_points'] for r in records.values() if 'gain_weighted_points' in r]
             complete = [r for r in records.values() if r['phase'] == 'complete']
             atomic_json(args.output_dir/'progress.json', dict(users_total=len(users),
                 users_with_baseline=len(gains), users_complete=len(complete),
@@ -522,7 +648,7 @@ def main():
     def run_user(user):
         for attempt in range(args.user_retries+1):
             try:
-                return evolve_user(user, groups[user], args, qa, gate, library, report)
+                return evolve_user(user, groups[user], args, qa, gate, library, report, adapter=adapter)
             except Exception as error:
                 if attempt == args.user_retries:
                     raise

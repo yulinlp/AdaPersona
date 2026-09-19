@@ -21,6 +21,12 @@ historical profile abstracts used as pseudo references are explicitly recorded
 as profile-only self-supervision. This is adaptation using allowed user history,
 not model-parameter training.
 
+For the original LaMP user split, the same boundary is implemented for tasks
+2/3/4/5. Each native profile item supplies a leave-one-out historical
+input/target pair; the current native task remains in `test.jsonl` for the
+outer scorer. The task adapter keeps classification/rating metrics separate
+from the ROUGE/BLEU/METEOR objective used by text-generation tasks.
+
 ## V5 search
 
 The default is 10 iterations, four proposals per operation, and archive-beam
@@ -86,3 +92,14 @@ prediction, confirmation, history, archive, and failure-bank files. A source or
 protocol hash mismatch requires a fresh output directory. Service errors are
 visible and retried a bounded number of times; an operation with no usable
 candidate does not advance.
+# Adaptive single-operation rounds
+
+The per-user runner now defaults to 10 rounds, with **one** operation per round
+chosen by the code evolver: `macro_strategy` or `micro_repair`. There is no fixed
+alternation or quota. Each round proposes at most 3 candidates (at most 30 across
+10 rounds, excluding seed evaluation, confirmation executions and syntax repairs).
+Selection uses historical-profile adaptation evidence only, never held-out test
+scores. Decisions and reasons are checkpointed in `iNN_operation_choice.json`.
+Invalid decisions fail the attempt rather than silently forcing an operation.
+The new protocol must use a fresh run directory; old two-operation runs are not
+compatible and already-running processes do not adopt these changes automatically.

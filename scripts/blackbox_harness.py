@@ -67,10 +67,16 @@ class QA(Protocol):
 class VLLMQA:
     """Thin black-box adapter around the local OpenAI-compatible vLLM server."""
 
-    def __init__(self, client: VLLMOpenAIClient, max_calls: int = 8, embedding_client=None) -> None:
+    def __init__(self, client: VLLMOpenAIClient, max_calls: int = 8,
+                 embedding_client=None, deterministic: bool = True) -> None:
         self.client = client
         self._embedding_client = embedding_client
         self.max_calls = max(1, int(max_calls))
+        # Evolution-time Code Agent calls may explore stochastically, but the
+        # answer/evaluation broker must be reproducible.  A harness may pass
+        # sampling kwargs through the public signature for compatibility, but
+        # they are clamped here before reaching the frozen QA model.
+        self.deterministic = bool(deterministic)
         self.calls = 0
         self.embedding_texts = 0
         self.embedding_chars = 0
@@ -113,6 +119,8 @@ class VLLMQA:
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> str:
+        if self.deterministic:
+            temperature, top_p = 0.0, 1.0
         self._reserve(1)
         output = self.client.generate_batch(
             [str(prompt)],
@@ -142,6 +150,8 @@ class VLLMQA:
         prompts = [str(prompt) for prompt in prompts]
         if not prompts:
             return []
+        if self.deterministic:
+            temperature, top_p = 0.0, 1.0
         self._reserve(len(prompts))
         outputs = self.client.generate_batch(
             prompts,
@@ -211,7 +221,19 @@ def strip_code_fence(value: str) -> str:
     # when asked for source only. Extract the first complete Python fence so
     # that harmless transport prose cannot become a syntax error on line 1.
     match = re.search(r"```(?:python|py)?\s*(.*?)```", text, re.I | re.S)
-    return match.group(1).strip() if match else text
+    if match:
+        return match.group(1).strip()
+    # A serving response can be cut at a natural end-of-source boundary
+    # without emitting the closing fence.  The content after the opening
+    # fence is still a complete candidate; do not turn it into a needless
+    # compiler-repair request.
+    opening = re.match(r"^```(?:python|py)?\s*\n?", text, re.I)
+    if opening:
+        remainder = text[opening.end():]
+        if remainder.rstrip().endswith("```"):
+            remainder = remainder.rstrip()[:-3]
+        return remainder.strip()
+    return text
 
 
 def _import_guard(name: str, globals: dict[str, Any] | None = None, locals: dict[str, Any] | None = None, fromlist: tuple[str, ...] = (), level: int = 0) -> Any:

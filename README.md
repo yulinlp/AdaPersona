@@ -1,108 +1,140 @@
 # AdaPersona
 
-AdaPersona is a black-box, per-user personalized-harness RSI system for
-LongLaMP abstract generation.  The current protocol is V5: a separate Python
-harness is evolved for each user, while the harness keeps the fixed interface
-`run(row, qa) -> str`.
+**Personalization by evolving a user's inference program, without updating model weights.**
 
-The runtime is model-agnostic at the interface level.  All model calls made by
-an evolved harness go through the frozen `qa` broker; the outer Code Agent
-rewrites complete harness source during evolution.  The default experiment is
-Qwen3.8-27B Code Agent + Qwen2.5-7B Answer Agent, with a Qwen3.8/Qwen3.8
-variant supported by the same CLI.
+## Motivation
 
-## Strict user-split test-time adaptation
+People differ in interests, writing style, and preferences. One fixed retrieval-and-prompt recipe need not work equally well for every user. AdaPersona asks whether an LLM can use a user's historical examples to discover a better *inference harness*: executable code that organizes history, retrieves evidence, constructs prompts, and combines black-box model calls.
 
-The reproducible protocol is:
+The research hypothesis is that per-user program search can improve personalization over fixed inference recipes. This repository implements that hypothesis; it does not claim state-of-the-art performance or established generalization from a small pilot.
 
-1. Prepare the disjoint LongLaMP user split with
-   `scripts/prepare_longlamp_abstract_user_pilot.py`.
-2. Build test-user profile-only leave-one-out tasks with
-   `scripts/prepare_profile_only_tta.py`.
-3. Evolve one harness per test user using only `profile_adaptation.jsonl`.
-4. Optionally select seed/current using `profile_selection.jsonl`.
-5. Run the frozen selected harness once on `test.jsonl` with
-   `scripts/evaluate_profile_only_test.py`.
+## Method
 
-The official test target is available only to the outer scorer.  It is not
-passed to a harness, Code Agent, failure bank, or selection step.
+Each user has an independent Python program with one interface:
 
-Example setup:
-
-```bash
-python scripts/prepare_longlamp_abstract_user_pilot.py \
-  --output data/experiments/longlamp_abstract_user_rsi
-python scripts/prepare_profile_only_tta.py \
-  --output data/experiments/longlamp_abstract_user_rsi_tta
+```python
+def run(row, qa) -> str:
+    # row: current input and historical profile; no reference answer
+    # qa: generate(), generate_many(), embed()
+    ...
 ```
 
-Run the default V5 search:
+There are no mandatory internal modules. The Code Agent may implement lexical/semantic retrieval, profile summaries, graph-based memory, prompt construction, planning, revision, or candidate selection. The [strategy library](docs/BLACKBOX_STRATEGY_LIBRARY.md) provides optional inspiration, not a required architecture. White-box activation editing and custom decoding hooks are outside the API contract.
+
+For each user:
+
+1. Construct up to eight leave-one-out tasks from their historical profile. Each task hides its historical answer and removes its source item from the runtime history. Historical outputs are self-supervised adaptation targets, not the current official test answer.
+2. Evaluate a retrieval-based seed harness on those adaptation tasks.
+3. For each of **10 rounds**, the Code Agent chooses **one** operation: `macro_strategy` (change strategy) or `micro_repair` (refine implementation). There is no alternation schedule or operation quota.
+4. Propose at most **3 candidate programs total per round**. Archive-beam search retains alternative lineages rather than following only accepted programs. By default one slot is reserved for the incumbent; the rest explore archive parents when available. `--incumbent-slots` exposes this search-policy choice.
+5. Validate and execute candidates in disposable processes. The failure bank records historical-adaptation errors and regressions. Acceptance requires zero execution errors, a strict objective improvement, and fresh candidate/parent rechecks. Otherwise keep the incumbent.
+6. Independently evaluate the incumbent on the user's official test task after the seed and every committed round.
+
+Ten rounds provide at most 30 candidate slots, not 30 accepted improvements. Seed evaluations, syntax-repair requests, smoke executions and confirmation executions consume additional compute. This is recursive **code** improvement, not gradient training. No meta-policy is trained in these experiments.
+
+## Evaluation boundary
+
+We use user-split data and perform profile-only adaptation separately for selected test users. The evolver sees historical tasks, historical references, code and adaptation feedback. It does **not** receive the current official test input, target, or monitored test scores.
+
+The runtime receives the current input and profile, never its reference. Test outputs are stored outside the evolution directory and are not used for candidate selection, early stopping, cohort selection, or choosing a reported best iteration. The primary comparison uses the incumbent after the predeclared 10 rounds; per-round test curves are descriptive monitoring only.
+
+This is history-supervised test-time adaptation, not adaptation without any reference signal. Inspecting test curves while redesigning the method can still introduce researcher-level test tuning. A separate untouched cohort is needed for a final confirmatory evaluation.
+
+## Experiments
+
+The Code Agent is **Qwen/Qwen3.8-27B in every condition**. Two frozen Answer Models are evaluated independently on the same users:
+
+| Condition | Code Agent | Answer Model |
+| --- | --- | --- |
+| qwen25 | Qwen/Qwen3.8-27B | Qwen2.5-7B-Instruct |
+| qwen38 | Qwen/Qwen3.8-27B | Qwen/Qwen3.8-27B |
+
+Every LLM call inside a harness uses that condition's Answer Model. PAG profile generation and CoT planning also use the condition's Answer Model. The Code Agent only evolves code. Embeddings use Qwen3-Embedding-0.6B. Existing local OpenAI-compatible services provide inference; no external commercial API is required.
+
+Benchmarks:
+
+- **LongLaMP:** abstract generation using the prepared user-split cohort.
+- **Original LaMP:** task 2 (news categories), 3 (review ratings), 4 (news headlines), and 5 (paper titles). This uses the original category-classification LaMP-2 data, not a movie-tagging task bearing the same number.
+
+Users across tasks are not assumed to be the same people. LaMP-1/6/7 and LaMP-QA are outside this experiment.
+
+Every selected user must have **all four baselines and a complete RSI trajectory**:
+
+| Method | Local implementation |
+| --- | --- |
+| Full Context | Concatenated history within a declared context budget |
+| RAG | BM25 retrieval of two historical examples |
+| PAG | Generate a natural-language user profile, then answer using it |
+| CoT | Generate a history-conditioned plan, then the final answer |
+| AdaPersona RSI | Independently evolved per-user Python harness |
+
+These are reproducible local baselines, **not claims of paper-exact reproduction**. Full Context is budgeted, not an assertion that all history fits. Baselines share an 18,000-character task-plus-history safety budget across Answer Models. History is truncated when necessary; a current task over 12,000 characters raises an explicit error. Final answers allow 256 tokens for abstracts and 128 for LaMP tasks. Evolved programs may vary context and multi-call strategies within the runtime contract (8 QA calls/task). Thus the comparison is not compute-matched: report calls/runtime alongside quality and add matched-budget ablations before causal conclusions.
+
+The initial suite uses **2 users per task**, selected in source-file order before scoring: 5 tasks × 2 Answer Models = 10 configurations. This is an operational pilot, not enough for population-level claims. Increase `--users` for larger runs.
+
+## Metrics and determinism
+
+- Text generation: report ROUGE-1, ROUGE-2, ROUGE-L, BLEU and METEOR. Optimize `0.25*ROUGE-1 + 0.35*ROUGE-L + 0.20*BLEU + 0.20*METEOR`.
+- LaMP-2: optimize exact category accuracy. Report cohort-level macro-F1 separately. `label_f1` is label-string overlap for diagnostics, **not** classification F1.
+- LaMP-3: optimize `1 - MAE/4`; separately report raw MAE/RMSE, accuracy and invalid outputs. Only an integer 1–5 is accepted; invalid outputs receive maximum error 4.
+
+Quality/objective scores are displayed on a 0–100 scale. Raw MAE/RMSE are lower-is-better and remain in rating units. Do not combine different tasks into one purported benchmark score.
+
+QA requests use temperature=0, top_p=1, top_k=1, seed=0 and thinking disabled. The evolver uses temperature=0.7, top_p=0.9, without an explicit output-token cap; serving context remains a hard limit. Request settings alone do not prove server determinism. Confirmations and code hashes support auditing repeated executions.
+
+## Run
+
+Use Python 3.11 with numpy, scipy, scikit-learn, networkx, and:
 
 ```bash
-TRAIN=data/experiments/longlamp_abstract_user_rsi_tta/profile_adaptation.jsonl \
-OUTPUT_DIR=data/experiments/longlamp_abstract_user_rsi_tta/runs/profile_only_v5_i10_b4 \
-bash scripts/run_per_user_evo.sh
-```
-
-The shell wrapper also accepts `AGENT_URL`, `AGENT_MODEL`, `QA_URL`, and
-`QA_MODEL`.  For example, both evolution and answering can use Qwen3.8:
-
-```bash
-AGENT_URL=http://gpu02:18012/v1 AGENT_MODEL=Qwen/Qwen3.8-27B \
-QA_URL=http://gpu02:18012/v1 QA_MODEL=Qwen/Qwen3.8-27B \
-bash scripts/run_per_user_evo.sh
-```
-
-Then select and score:
-
-```bash
-python scripts/select_profile_only_harness.py \
-  --run-dir data/experiments/longlamp_abstract_user_rsi_tta/runs/profile_only_v5_i10_b4 \
-  --selection data/experiments/longlamp_abstract_user_rsi_tta/profile_selection.jsonl
-
-python scripts/evaluate_profile_only_test.py \
-  --run-dir data/experiments/longlamp_abstract_user_rsi_tta/runs/profile_only_v5_i10_b4 \
-  --output-dir data/experiments/longlamp_abstract_user_rsi_tta/runs/official_test_scores
-```
-
-For a live view of official test performance after every completed evolution
-operation, run the independent hidden-test monitor:
-
-    python scripts/monitor_hidden_test.py \
-      --run-dir data/experiments/longlamp_abstract_user_rsi_tta/runs/profile_only_v5_i10_b4 \
-      --test data/experiments/longlamp_abstract_user_rsi_tta/test.jsonl \
-      --output-dir data/experiments/longlamp_abstract_user_rsi_tta/shadow_test_monitor
-
-It writes only metrics outside the evolution run directory. Hidden targets and
-scores never enter candidate selection, the failure bank, or Code Agent prompts.
-
-## V5 search contract
-
-Each operation has two families: `macro_strategy` proposes a substantially
-different workflow, and `micro_repair` repairs a measured weakness.  The
-archive-beam policy keeps diverse evaluated parents instead of following only
-one chain.  Candidates are executable Python source, validated and run in
-isolated processes.  A candidate must have zero execution errors and strictly
-improve the per-user weighted objective to become the incumbent; accepted
-candidates are rechecked against a fresh parent execution.
-
-The objective is reported on a 0--100 scale:
-
-`0.25 ROUGE-1 + 0.35 ROUGE-L + 0.20 BLEU + 0.20 METEOR`.
-
-See [docs/PER_USER_RSI.md](docs/PER_USER_RSI.md) for the full protocol and
-[docs/BLACKBOX_STRATEGY_LIBRARY.md](docs/BLACKBOX_STRATEGY_LIBRARY.md) for the
-non-binding strategy reference given to the Code Agent.
-
-## Baselines and tests
-
-`scripts/benchmark_longlamp_nontraining.py` contains same-backbone
-Full-context, BM25-RAG, PAG/profile-summary, and CoT baselines.  The test suite
-is run with:
-
-```bash
+pip install -r requirements-evolution.txt
 python -m unittest discover -s tests -q
 ```
 
-Install metric dependencies from `requirements-evolution.txt`.  Local model
-servers and datasets are intentionally excluded from Git.
+METEOR needs NLTK WordNet under `data/nltk_data`; metric preflight checks availability. Model serving is separate. Disposable processes provide defense in depth, not a hardened hostile-code OS sandbox. Use restricted accounts and network access.
+
+Prepare LongLaMP with `scripts/prepare_longlamp_abstract_user_pilot.py` and `scripts/prepare_profile_only_tta.py` (see `--help`). Prepare original LaMP:
+
+```bash
+python scripts/lamp_tasks.py --source-root data/benchmarks/LaMP/user \
+  --output data/experiments/lamp_user_rsi/lamp_2 --task 2 --adaptation-items 8
+# Repeat for tasks 3, 4 and 5.
+```
+
+The suite expects `profile_adaptation.jsonl` and `test.jsonl` under:
+
+```text
+data/experiments/longlamp_abstract_user_rsi_tta/
+data/experiments/lamp_user_rsi/lamp_2/
+data/experiments/lamp_user_rsi/lamp_3/
+data/experiments/lamp_user_rsi/lamp_4/
+data/experiments/lamp_user_rsi/lamp_5/
+```
+
+Set service addresses/model IDs in `scripts/paired_suite.py` for your deployment. Checked-in defaults are `gpu02:18012` (Qwen3.8), `gpu01:8000` (Qwen2.5), and `gpu01:18013` (embedding).
+
+```bash
+export NO_PROXY=localhost,127.0.0.1,gpu01,gpu02
+export no_proxy="$NO_PROXY"
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+python -u -m scripts.paired_suite \
+  --output-dir data/experiments/paired_main \
+  --users 2 --workers 4 --iterations 10 --branches 3
+```
+
+The suite fixes a cohort manifest, runs all baselines for a configuration, starts its RSI plus per-round monitor, and verifies per-user completeness before marking it complete. Four configurations run concurrently; others queue. Failures are explicitly marked. Rerun with the same directory/protocol to resume; source or configuration changes require a fresh directory.
+
+Artifacts under the output directory:
+
+```text
+suite.json       experiment matrix and budgets
+cohorts/         paired user manifests and data hashes
+baseline/        baseline code, predictions and summaries
+rsi/             code, operation choices, failure banks and checkpoints
+test_monitor/    seed and per-round official-test results
+status/          queued/running/complete/failed per configuration
+logs/            runner and monitor logs
+completion.json  final completeness result
+```
+
+Datasets, weights, credentials and generated user artifacts are not uploaded to GitHub. Keep experiment outputs separate from version-controlled method code.

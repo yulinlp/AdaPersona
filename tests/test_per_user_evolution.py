@@ -9,6 +9,12 @@ from scripts import evolve_per_user as per
 
 
 class PerUserTest(unittest.TestCase):
+    def setUp(self):
+        chooser = patch.object(per.evo, 'choose_operation', return_value={
+            'operation': 'macro_strategy', 'reason': 'Historical adaptation evidence'})
+        chooser.start()
+        self.addCleanup(chooser.stop)
+
     def test_independent_acceptance_failure_banks_and_resume(self):
         seen = []
         proposal = {'valid': True, 'code': "def run(row, qa):\n    return 'alpha'"}
@@ -66,12 +72,11 @@ class PerUserTest(unittest.TestCase):
             with patch.object(per.evo, 'evaluate_code', side_effect=evaluate), patch.object(
                     per.evo, 'propose_candidates', return_value=[proposal]):
                 state = per.evolve_user('A', rows, args, None, threading.Semaphore(), '', lambda _: None)
-            # One seed evaluation plus one smoke execution for each of the two
-            # operation families in a one-iteration run; no full 8-row pass.
-            self.assertEqual([size for _, size in calls], [1, 1, 1])
+            # One seed plus one chosen operation's smoke execution; no full pass.
+            self.assertEqual([size for _, size in calls], [1, 1])
             directory = Path(tmp) / 'users' / per.user_key('A')
             self.assertTrue((directory / 'i01_macro_strategy_b0_smoke_failed.json').exists())
-            self.assertTrue((directory / 'i01_micro_repair_b0_smoke_failed.json').exists())
+            self.assertFalse((directory / 'i01_micro_repair_b0_smoke_failed.json').exists())
             self.assertEqual(Path(state['code_path']).name, 'seed.py')
 
     def test_acceptance_uses_weighted_four_metric_objective(self):
