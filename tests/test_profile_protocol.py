@@ -7,10 +7,59 @@ import unittest
 from unittest.mock import patch
 from scripts import code_evolution as evo
 from scripts import evolve_per_user as per
-from scripts.profile_protocol import abstract_input, build_history_partitions, history_key, task_hint_loss
+from scripts.profile_protocol import abstract_input, build_history_partitions, history_key, task_hint_loss, validate_history_partitions
 
 
 class ProfileProtocolTest(unittest.TestCase):
+    def test_same_input_alternate_references_stay_in_one_group(self):
+        profile = [dict(text=f'article {i}', title=f'headline {i}') for i in range(12)]
+        profile += [dict(text=f'article {i}', title=f'alternate headline {i}') for i in range(12)]
+        fit, held, audit = build_history_partitions('u', profile, 'lamp', 4)
+        self.assertEqual(audit['usable_history'], 12)
+        self.assertEqual(audit['unique_source_records'], 24)
+        protected = {k for row in held for k in row['historical_source_keys']}
+        for row in fit+held:
+            self.assertEqual(len(row['historical_source_keys']), 2)
+            forbidden = protected | set(row['historical_source_keys'])
+            self.assertFalse(forbidden & {history_key(p) for p in row['profile']})
+        self.assertFalse({r['input'] for r in fit} & {r['input'] for r in held})
+
+    def test_metadata_and_whitespace_copies_are_one_source(self):
+        profile = [dict(id=str(i), text=f'news {i}', title=f'headline {i}') for i in range(12)]
+        for item in list(profile):
+            profile.append(dict(item, id='copy'+item['id'], timestamp='later',
+                                text='  '+item['text']+'\n'))
+        fit, held, audit = build_history_partitions('u', profile, 'lamp', 4)
+        self.assertEqual(audit['usable_history'], 12)
+        for row in fit+held:
+            keys = {history_key(p) for p in row['profile']}
+            self.assertNotIn(row['historical_key'], keys)
+            self.assertFalse(keys & {r['historical_key'] for r in held})
+
+    def test_partition_loader_rejects_source_and_profile_leaks(self):
+        source = dict(text='a historical article', title='its original headline')
+        key = history_key(source)
+        fit = [dict(input='fit', historical_key='another', profile=[])]
+        held = [dict(input='held', historical_key=key, profile=[])]
+        validate_history_partitions(fit, held)
+        fit[0]['profile'] = [dict(source, id='new-id', timestamp='new-date')]
+        with self.assertRaisesRegex(ValueError, 'runtime profile'):
+            validate_history_partitions(fit, held)
+        fit[0]['profile'] = []
+        fit[0]['historical_key'] = key
+        with self.assertRaisesRegex(ValueError, 'both fit and selection'):
+            validate_history_partitions(fit, held)
+
+    def test_split_reference_literals_and_long_excerpts_rejected(self):
+        gold = ' '.join(f'word{i}' for i in range(40))
+        row = dict(target=gold, benchmark='longlamp')
+        halves = [gold[:100], gold[100:]]
+        for expression in (repr(halves[0])+' + '+repr(halves[1]),
+                           "''.join("+repr(halves)+")", repr(' '.join(gold.split()[5:30]))):
+            with self.subTest(expression=expression):
+                self.assertIsNotNone(evo.reference_literal_leak('def run(row, qa): return '+expression, [row]))
+        self.assertIsNone(evo.reference_literal_leak('def run(row, qa): return "word1 word2"', [row]))
+
     def test_phrase_hints_and_conservation(self):
         text = abstract_input('Graph algorithms', 'We study bipartite permutation graphs and parallel scheduling algorithms.')
         self.assertIn('bipartite permutation graphs', text)
@@ -64,6 +113,23 @@ class ProfileProtocolTest(unittest.TestCase):
                 state=per.evolve_user('u',fit,args,None,threading.Semaphore(),'',lambda r:None,selection_rows=held)
             self.assertEqual(Path(state['code_path']).name, 'seed.py')
             self.assertEqual(state['completed_operations'], 1)
+
+    def test_fitting_only_gain_is_archived_but_not_promoted(self):
+        child = 'def run(row, qa): return "memorizer"'
+        fit = [dict(user_id='u', sample_id='fit', input='fit question', target='alpha beta gamma', profile=[])]
+        held = [dict(user_id='u', sample_id='held', input='held question', target='private selection answer', profile=[])]
+        def evaluate(code, rows, qa, **kwargs):
+            return [dict(r, prediction=r['target'] if code == child and r['sample_id'] == 'fit' else 'wrong',
+                         error='', qa_calls=1) for r in rows]
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(output_dir=Path(tmp), iterations=1, branches=1, agent_url='unused')
+            with patch.object(evo, 'evaluate_code', side_effect=evaluate), patch.object(evo, 'propose_candidates', return_value=[dict(valid=True, code=child)]), patch.object(evo, 'choose_operation', return_value=dict(operation='macro_strategy', reason='fit evidence')):
+                state = per.evolve_user('u', fit, args, None, threading.Semaphore(), '', lambda r: None, selection_rows=held)
+            self.assertEqual(Path(state['code_path']).name, 'seed.py')
+            directory = Path(tmp)/'users'/per.user_key('u')
+            archive = evo.load_jsonl(directory/'archive.jsonl')
+            self.assertTrue(any(r['candidate_id'] == 'i01_macro_strategy_b0' for r in archive))
+            self.assertNotIn('private selection answer', (directory/'failure_bank.jsonl').read_text())
 
     def test_seed_pool_selected_from_history_not_test(self):
         fit = [dict(user_id='u',sample_id='fit',input='task',target='alpha beta gamma',profile=[])]

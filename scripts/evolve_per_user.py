@@ -23,12 +23,14 @@ try:
     from .search_policy import select_parent_branches
     from .lamp_tasks import LampTaskAdapter
     from .execution_audit import compare_executions, historical_improvement
+    from .profile_protocol import validate_history_partitions
 except ImportError:
     import code_evolution as evo
     from embedding_client import EmbeddingClient
     from search_policy import select_parent_branches
     from lamp_tasks import LampTaskAdapter
     from execution_audit import compare_executions, historical_improvement
+    from profile_protocol import validate_history_partitions
 
 
 def atomic_json(path, value):
@@ -114,7 +116,7 @@ def protocol_for(args):
     qa_tag = qa_model.replace('/', '_').replace('-', '_')
     benchmark = getattr(args, 'benchmark', 'longlamp')
     task = getattr(args, 'task', 'abstract_generation')
-    prefix = f'{benchmark}-{task}-history-pareto-stability-v2'
+    prefix = f'{benchmark}-{task}-history-hidden-gain-v3'
     if getattr(args, 'search_strategy', 'greedy') == 'archive_beam':
         return f'{prefix}-per-user-code-v5-archive-beam-planned-smoke-weighted-agent-{agent_tag}-qa-{qa_tag}'
     return f'{prefix}-{PROTOCOL}-agent-{agent_tag}-qa-{qa_tag}'
@@ -131,6 +133,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
     if not 1 <= args.branches <= 3:
         raise ValueError('Each round supports at most three candidates')
     selection_rows = list(selection_rows or [])
+    validate_history_partitions(rows, selection_rows)
     if selection_rows and ({str(r['user_id']) for r in selection_rows} != {user_id} or
             {r['sample_id'] for r in rows} & {r['sample_id'] for r in selection_rows}):
         raise ValueError('History selection isolation violation')
@@ -526,7 +529,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
             if not historical_improvement(adapter, candidate['summary'], summary,
                     candidate.get('selection_summary'), state.get('selection_summary')):
                 atomic_json(directory/(candidate['candidate_id']+'_admission.json'), dict(
-                    accepted=False, reason='no_error_free_historical_pareto_improvement'))
+                    accepted=False, reason='no_error_free_hidden_selection_gain_without_fit_regression'))
                 continue
             publish('confirming:' + candidate['candidate_id'])
             ccode, _, _ = read_branch(candidate)

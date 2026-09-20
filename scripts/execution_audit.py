@@ -36,7 +36,7 @@ def compare_executions(first, second):
 
 
 def historical_improvement(adapter, child, parent, child_selection=None, parent_selection=None):
-    """Pareto improvement: neither history partition regresses, one improves.
+    """Require hidden-selection improvement, not fitting-only memorization.
 
     Allows fitting plateaus (including perfect accuracy) to improve selection.
     Does not permit trading fitting losses for selection gains.
@@ -44,9 +44,11 @@ def historical_improvement(adapter, child, parent, child_selection=None, parent_
     if child.get('errors', 0) or parent.get('errors', 0):
         return False
     fit = adapter.weighted_score(child) - adapter.weighted_score(parent)
+    if (child_selection is None) != (parent_selection is None):
+        return False
     if child_selection is None or parent_selection is None:
         return fit > 1e-12
     if child_selection.get('errors', 0) or parent_selection.get('errors', 0):
         return False
     held = adapter.weighted_score(child_selection) - adapter.weighted_score(parent_selection)
-    return fit >= -1e-12 and held >= -1e-12 and (fit > 1e-12 or held > 1e-12)
+    return fit >= -1e-12 and held > 1e-12

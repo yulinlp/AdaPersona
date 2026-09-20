@@ -12,6 +12,8 @@ class ExecutionAuditTest(unittest.TestCase):
         self.assertTrue(historical_improvement(adapter, score(1), score(1), score(.75), score(.5)))
         self.assertFalse(historical_improvement(adapter, score(.9), score(1), score(.75), score(.5)))
         self.assertFalse(historical_improvement(adapter, score(1), score(1), score(.5), score(.5)))
+        self.assertFalse(historical_improvement(adapter, score(1), score(.5), score(.5), score(.5)))
+        self.assertFalse(historical_improvement(adapter, score(1), score(.5), score(.5), None))
         self.assertFalse(historical_improvement(adapter, score(1), score(.9), score(.4), score(.5)))
         self.assertFalse(historical_improvement(adapter, dict(score(1), errors=1), score(.9)))
 

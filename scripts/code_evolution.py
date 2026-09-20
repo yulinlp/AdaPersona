@@ -754,14 +754,47 @@ def reference_literal_leak(code, rows):
     lookup key.  This is a conservative direct-leak check, not a proof
     against arbitrary obfuscation or learned semantic memorization.
     """
-    literals = [' '.join(n.value.split()) for n in ast.walk(ast.parse(code))
+    tree = ast.parse(code)
+    literals = [' '.join(n.value.split()) for n in ast.walk(tree)
                 if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    # Resolve common split-string disguises without evaluating candidate code.
+    # This deliberately does not attempt arbitrary decoding or interpretation.
+    def static_text(node, depth=0):
+        if depth > 20:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value if len(node.value) <= 100_000 else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = static_text(node.left, depth+1), static_text(node.right, depth+1)
+            if left is not None and right is not None and len(left)+len(right) <= 100_000:
+                return left + right
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'join' and len(node.args) == 1 and not node.keywords
+                and isinstance(node.args[0], (ast.List, ast.Tuple))):
+            sep = static_text(node.func.value, depth+1)
+            parts = [static_text(n, depth+1) for n in node.args[0].elts]
+            if (sep is not None and all(p is not None for p in parts)
+                    and sum(len(p) for p in parts)+len(sep)*len(parts) <= 100_000):
+                return sep.join(parts)
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.BinOp, ast.Call)):
+            value = static_text(node)
+            if value is not None:
+                literals.append(' '.join(value.split()))
     literal_set = set(literals)
     for row in rows:
         gold = ' '.join(str(row.get('target', '')).split())
         generation_reference = row.get('benchmark') == 'longlamp' or row.get('task') in (4, 5)
         if (len(gold) >= 100 or (generation_reference and len(gold.split()) >= 4)) and any(gold in text for text in literals):
             return 'candidate embeds a complete training reference literal; infer a policy, not answers'
+        # Catch substantial answer excerpts as well as complete answers, while
+        # leaving short style phrases and classification labels unrestricted.
+        words = gold.casefold().split()
+        if len(words) >= 20:
+            spans = {' '.join(words[i:i+20]) for i in range(len(words)-19)}
+            if any(span in text.casefold() for text in literals for span in spans):
+                return 'candidate embeds a long training reference excerpt; retrieve permitted profile evidence at runtime'
         sample_id = ' '.join(str(row.get('sample_id', '')).split())
         if len(sample_id) >= 8 and sample_id in literal_set:
             return 'candidate embeds a training sample_id lookup; infer a policy, not answer tables'
