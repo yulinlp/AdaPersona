@@ -61,6 +61,8 @@ def abstract_input(title, abstract):
 
 
 def build_history_partitions(user_id, profile, benchmark, task=None, fit_limit=8, selection_limit=4):
+    if fit_limit < 1 or selection_limit < 1:
+        raise ValueError('Historical fitting and selection budgets must be positive')
     try:
         from .lamp_tasks import history_task
     except ImportError:

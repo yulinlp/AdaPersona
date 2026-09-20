@@ -18,7 +18,7 @@ def run_isolated(code, row, qa, timeout=300):
     worker = Path(__file__).with_name('harness_worker.py').resolve()
     env = {k: v for k, v in os.environ.items() if k in
            {'PATH', 'LANG', 'LC_ALL', 'OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'}}
-    env.update(PYTHONDONTWRITEBYTECODE='1', OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONHASHSEED='0', OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
     with tempfile.TemporaryDirectory(prefix='personalized-harness-') as directory:
         process = subprocess.Popen([sys.executable, '-B', str(worker)], cwd=directory, env=env,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,

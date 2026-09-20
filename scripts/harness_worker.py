@@ -85,6 +85,12 @@ def main():
             roots.add((node.module or '').split('.')[0])
     for root in roots & {'numpy', 'scipy', 'sklearn', 'networkx'}:
         importlib.import_module(root)
+    # These seeds belong only to the disposable Answer harness, never the
+    # stochastic Code Agent. Explicit local generators still need a fixed seed.
+    import random
+    random.seed(0)
+    if 'numpy' in sys.modules:
+        sys.modules['numpy'].random.seed(0)
     restrict_io()
     try:
         with contextlib.redirect_stdout(sys.stderr):

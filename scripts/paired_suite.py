@@ -49,7 +49,7 @@ def run(row, qa):
         ts = [tokens(d) for d in docs]
         df = Counter(t for d in ts for t in set(d))
         avg = sum(map(len, ts)) / max(1, len(ts))
-        q = set(tokens(query))
+        q = sorted(set(tokens(query)))
         scored = []
         for i, d in enumerate(ts):
             tf = Counter(d)
@@ -78,7 +78,7 @@ def run(row, qa):
 def adapter_for(spec):
     return LongLaMPAdapter() if spec['benchmark'] == 'longlamp' else LampTaskAdapter(spec['task'])
 
-def prepare(root, users):
+def prepare(root, users, history_fit_items=16, history_selection_items=8):
     specs = []
     sources = [('longlamp', None, Path('data/experiments/longlamp_abstract_user_rsi_tta'))]
     sources += [('lamp', t, Path(f'data/experiments/lamp_user_rsi/lamp_{t}')) for t in (2,3,4,5)]
@@ -97,7 +97,8 @@ def prepare(root, users):
         ids = {str(r['user_id']) for r in test_rows}
         train, selection, audits = [], [], []
         for row in test_rows:
-            fit, held, audit = build_history_partitions(str(row['user_id']), row['profile'], benchmark, task)
+            fit, held, audit = build_history_partitions(str(row['user_id']), row['profile'], benchmark, task,
+                fit_limit=history_fit_items, selection_limit=history_selection_items)
             train.extend(fit)
             selection.extend(held)
             # Retain missing-input official tasks. Annotate; never filter by score.
@@ -223,9 +224,14 @@ def main():
     parser.add_argument('--user-workers', type=int, default=1)
     parser.add_argument('--agent-concurrency', type=int, default=1)
     parser.add_argument('--qa-concurrency', type=int, default=16)
+    parser.add_argument('--history-fit-items', type=int, default=16)
+    parser.add_argument('--history-selection-items', type=int, default=8)
     parser.add_argument('--only', help='Optional exact configuration name for smoke tests')
+    parser.add_argument('--answer-models', nargs='+', choices=tuple(MODELS), default=list(MODELS),
+                        help='Explicit predeclared model subset; never filter using test scores')
     args = parser.parse_args()
-    if min(args.users, args.workers, args.user_workers, args.agent_concurrency, args.qa_concurrency, args.iterations) < 1:
+    if min(args.users, args.workers, args.user_workers, args.agent_concurrency, args.qa_concurrency,
+           args.iterations, args.history_fit_items, args.history_selection_items) < 1:
         parser.error('User counts, budgets and concurrency must be positive')
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -234,7 +240,8 @@ def main():
     import fcntl
     lock = (root/'suite.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    for url, model in MODELS.values():
+    for key in args.answer_models:
+        url, model = MODELS[key]
         with urllib.request.urlopen(url+'/models', timeout=15) as response:
             if model not in [m['id'] for m in json.load(response)['data']]:
                 raise RuntimeError(f'Model not served: {model}')
@@ -251,6 +258,10 @@ def main():
             raise ValueError('Cannot change suite protocol on resume')
         if bool(manifest.get('rsi_only', False)) != args.rsi_only:
             raise ValueError('Cannot change baseline coverage on resume')
+        if (manifest.get('history_fit_items', 8), manifest.get('history_selection_items', 4)) != (args.history_fit_items, args.history_selection_items):
+            raise ValueError('Cannot change historical partitions on resume')
+        if set(manifest.get('answer_models', MODELS)) != set(args.answer_models):
+            raise ValueError('Cannot change answer model coverage on resume')
         specs = manifest['configurations']
     else:
         # Execute workers/monitors from an immutable source copy, so editing
@@ -262,7 +273,8 @@ def main():
         # Metrics locate local resources relative to their source root.
         resource = root/'code_snapshot'/'data'
         resource.symlink_to(source_root/'data', target_is_directory=True)
-        specs = prepare(root, args.users)
+        specs = prepare(root, args.users, args.history_fit_items, args.history_selection_items)
+        specs = [s for s in specs if s['model'] in args.answer_models]
         if args.only:
             specs = [s for s in specs if s['name'] == args.only]
         if not specs:
@@ -271,6 +283,8 @@ def main():
             users_per_task=args.users, models=MODELS, methods=[] if args.rsi_only else METHODS,
             rsi_only=args.rsi_only, user_workers=args.user_workers, agent_concurrency=args.agent_concurrency,
             qa_concurrency=args.qa_concurrency, configuration_workers=args.workers,
+            history_fit_items=args.history_fit_items, history_selection_items=args.history_selection_items,
+            answer_models=args.answer_models,
             created=time.time(), source_hash=source_hash,
             baseline_definition='local black-box implementations, not paper-exact reproductions'))
     def execute(spec):

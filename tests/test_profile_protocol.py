@@ -79,6 +79,30 @@ class ProfileProtocolTest(unittest.TestCase):
             self.assertNotIn('secret historical label', bank)
             self.assertEqual(len(evo.load_jsonl(Path(tmp)/'users'/per.user_key('u')/'archive.jsonl')), 5)
 
+    def test_fit_plateau_and_selection_improvement_can_be_accepted(self):
+        child='def run(row, qa): return "improved"'
+        fit=[dict(user_id='u',sample_id='fit',input='fit task',target='alpha beta gamma',profile=[])]
+        held=[dict(user_id='u',sample_id='held',input='held task',target='private validation reference',profile=[])]
+        def evaluate(code, rows, qa, **kwargs):
+            return [dict(r,prediction=r['target'] if code==child or r['sample_id']=='fit' else 'wrong',error='',qa_calls=1) for r in rows]
+        with tempfile.TemporaryDirectory() as tmp:
+            args=argparse.Namespace(output_dir=Path(tmp),iterations=1,branches=1,agent_url='unused')
+            with patch.object(evo,'evaluate_code',side_effect=evaluate), patch.object(evo,'propose_candidates',return_value=[dict(valid=True,code=child)]), patch.object(evo,'choose_operation',return_value=dict(operation='micro_repair',reason='fit evidence')):
+                state=per.evolve_user('u',fit,args,None,threading.Semaphore(),'',lambda r:None,selection_rows=held)
+            self.assertEqual(Path(state['code_path']).read_text(),child)
+
+    def test_unstable_seed_blocks_formal_evolution(self):
+        fit=[dict(user_id='u',sample_id='fit',input='task',target='alpha beta gamma',profile=[])]
+        held=[dict(user_id='u',sample_id='held',input='private',target='hidden reference',profile=[])]
+        def evaluate(code, rows, qa, **kwargs):
+            return [dict(r,prediction='changed' if kwargs['label'].endswith(':seed') else r['target'],error='',qa_calls=1) for r in rows]
+        with tempfile.TemporaryDirectory() as tmp:
+            args=argparse.Namespace(output_dir=Path(tmp),iterations=1,branches=1,agent_url='unused',seed_pool=True)
+            with patch.object(evo,'evaluate_code',side_effect=evaluate), patch.object(evo,'propose_candidates') as proposer:
+                with self.assertRaisesRegex(RuntimeError,'not reproducible'):
+                    per.evolve_user('u',fit,args,None,threading.Semaphore(),'',lambda r:None,selection_rows=held)
+                proposer.assert_not_called()
+
     def test_fit_and_selection_improvement_can_be_accepted(self):
         child='def run(row, qa): return "improved"'
         fit=[dict(user_id='u',sample_id='fit',input='fit task',target='alpha beta gamma',profile=[])]
@@ -94,6 +118,32 @@ class ProfileProtocolTest(unittest.TestCase):
             self.assertAlmostEqual(state['selection_summary']['weighted_score'], exact['weighted_score'])
             history=(Path(tmp)/'users'/per.user_key('u')/'history.jsonl').read_text()
             self.assertNotIn('private validation reference',history)
+
+    def test_larger_history_budget_is_unique_and_disjoint(self):
+        profile = [dict(id=str(i), text=f'news {i}', title=f'headline {i}') for i in range(48)]
+        fit, held, _ = build_history_partitions('u', profile, 'lamp', 4, fit_limit=16, selection_limit=8)
+        self.assertEqual((len(fit), len(held)), (16,8))
+        self.assertEqual(len({r['historical_key'] for r in fit+held}), 24)
+        forbidden = {r['historical_key'] for r in held}
+        self.assertTrue(all(not forbidden.intersection(history_key(p) for p in r['profile']) for r in fit+held))
+        with self.assertRaises(ValueError):
+            build_history_partitions('u', profile, 'lamp', 4, fit_limit=0)
+
+    def test_changed_intermediate_response_vetoes_even_same_score(self):
+        child='def run(row, qa): return "improved"'
+        fit=[dict(user_id='u',sample_id='fit',input='fit task',target='alpha beta gamma',profile=[])]
+        held=[dict(user_id='u',sample_id='held',input='held task',target='private validation reference',profile=[])]
+        def evaluate(code, rows, qa, **kwargs):
+            response = 'different' if code==child and kwargs['label'].endswith(':confirm') else 'same'
+            return [dict(r,prediction=r['target'] if code==child else 'wrong',error='',qa_calls=1,
+                         qa_trace=[dict(prompt='fixed',response=response)]) for r in rows]
+        with tempfile.TemporaryDirectory() as tmp:
+            args=argparse.Namespace(output_dir=Path(tmp),iterations=1,branches=1,agent_url='unused')
+            with patch.object(evo,'evaluate_code',side_effect=evaluate), patch.object(evo,'propose_candidates',return_value=[dict(valid=True,code=child)]), patch.object(evo,'choose_operation',return_value=dict(operation='micro_repair',reason='fit evidence')):
+                state=per.evolve_user('u',fit,args,None,threading.Semaphore(),'',lambda r:None,selection_rows=held)
+            self.assertEqual(Path(state['code_path']).name,'seed.py')
+            admission=json.loads((Path(tmp)/'users'/per.user_key('u')/'i01_micro_repair_b0_admission.json').read_text())
+            self.assertEqual(admission['reason'],'execution_instability')
 
     def test_decision_format_repair_does_not_force_operation(self):
         with tempfile.TemporaryDirectory() as tmp:

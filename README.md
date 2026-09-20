@@ -23,18 +23,18 @@ There are no mandatory internal modules. The Code Agent may implement lexical/se
 
 For each user:
 
-1. Partition usable historical examples deterministically into up to eight fitting tasks and up to four selection tasks (smaller profiles use smaller sets). All selection examples are removed from fitting profiles as well as fitting targets. Each task also excludes its own historical source item. Historical outputs are self-supervised targets, not official test answers.
+1. Partition usable historical examples deterministically into up to 16 fitting tasks and up to 8 selection tasks by default in the suite (smaller profiles use smaller sets). All selection examples are removed from fitting profiles as well as fitting targets. Each task also excludes its own historical source item. Historical outputs are self-supervised targets, not official test answers.
 2. Evaluate the retrieval seed, Full Context, RAG, PAG and CoT on these historical tasks. Choose the best seed by selection score, breaking ties with fitting score, and retain the other fitting-evaluated seeds in the archive. No official test score is involved.
 3. For each of **10 rounds**, the Code Agent chooses **one** operation: `macro_strategy` (change strategy) or `micro_repair` (refine implementation). There is no alternation schedule or operation quota.
 4. Propose at most **3 candidate programs total per round**. Archive-beam search retains alternative lineages rather than following only accepted programs. By default one slot is reserved for the incumbent; the rest explore archive parents when available. `--incumbent-slots` exposes this search-policy choice.
-5. Validate and execute candidates in disposable processes. The failure bank records fitting errors and regressions only. Rank candidates by historical selection score, then fitting score. Acceptance requires zero errors, a strict fitting improvement, no historical-selection regression, and fresh candidate/parent rechecks on both partitions. Otherwise keep the incumbent. Selection examples, predictions and detailed scores are never passed to the Code Agent.
+5. Validate and execute candidates in disposable processes. The failure bank records fitting errors and regressions only. Rank candidates by historical selection score, then fitting score. Acceptance requires zero errors and a Pareto improvement across history partitions: neither fitting nor selection may regress, and at least one must improve. This allows perfect fitting accuracy to stay tied while selection improves. Fresh candidate/parent rechecks must reproduce predictions and call traces on both partitions. Otherwise keep the incumbent. Selection examples, predictions and detailed scores are never passed to the Code Agent.
 6. Independently evaluate the incumbent on the user's official test task after the seed and every committed round.
 
 Ten rounds provide at most 30 candidate slots, not 30 accepted improvements. Seed evaluations, syntax-repair requests, smoke executions and confirmation executions consume additional compute. This is recursive **code** improvement, not gradient training. No meta-policy is trained in these experiments.
 
 For LongLaMP, historical abstract tasks use full phrase hints extracted deterministically from the historical abstract, not isolated words copied from the title. This heuristic improves format alignment but is not an exact reproduction of the benchmark's keyword construction. An execution audit verifies that the title and every supplied phrase reach the Answer Model intact, allowing multi-call decomposition. It does not prescribe retrieval or memory architecture. Historical generative reference strings cannot be embedded directly in candidate source; examples must be retrieved from the runtime profile.
 
-Seed-repeat audits compare fresh requests without caching, and report output changes instead of assuming server determinism. This does not eliminate all execution noise.
+Seed-repeat audits compare fresh requests without caching. With multiple-seed initialization, any change in the selected seed's fitting or selection execution blocks formal evolution for that user. Confirmation audits veto unstable candidate updates. Audits identify the first divergence (changed request versus changed response to the same request), including intermediate calls whose changes do not alter the final answer. Disposable Python processes use `PYTHONHASHSEED=0`; generated code must still use deterministic algorithms. These checks detect observed instability, not prove that a server will always be deterministic. Unstable runs must not be represented as verified performance gains.
 
 ## Evaluation boundary
 
@@ -148,6 +148,28 @@ actual utilization depends on the current search phase and serving capacity.
 Independent test monitors add a small separate inference load. The five
 historical seed evaluations remain part of RSI initialization; `--rsi-only`
 does not bypass historical selection or per-round official-test monitoring.
+
+The suite defaults to up to 16 fitting and 8 disjoint historical-selection tasks
+per user (`--history-fit-items`, `--history-selection-items`). Short histories
+use fewer tasks, with exact counts recorded in each cohort's history audit.
+These are distinct historical examples, not repeated copies of the same task.
+The larger sample reduces reliance on a handful of examples; it does not remove
+synthetic-to-native task mismatch or guarantee generalization. Use explicit
+`--history-fit-items 8 --history-selection-items 4` for a budget-matched ablation.
+Changing partition budgets requires a fresh experiment directory.
+
+`--answer-models qwen38` explicitly restricts a suite to that Answer Model when
+another service is unavailable or fails reproducibility checks. The Code Agent
+remains Qwen3.8. Such a run does not complete the two-backbone experiment matrix.
+For a fresh, uncached historical-only repeat audit of an existing run:
+
+```bash
+python -m scripts.audit_execution --run-dir data/experiments/your_run \
+  --configuration longlamp_abstract_qwen38 --items 2 --repeats 3 \
+  --output data/experiments/audits/qwen38.json
+```
+
+Audit files contain full local historical traces and must not be uploaded as code.
 
 Artifacts under the output directory:
 

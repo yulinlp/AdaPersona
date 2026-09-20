@@ -22,11 +22,13 @@ try:
     from .embedding_client import EmbeddingClient
     from .search_policy import select_parent_branches
     from .lamp_tasks import LampTaskAdapter
+    from .execution_audit import compare_executions, historical_improvement
 except ImportError:
     import code_evolution as evo
     from embedding_client import EmbeddingClient
     from search_policy import select_parent_branches
     from lamp_tasks import LampTaskAdapter
+    from execution_audit import compare_executions, historical_improvement
 
 
 def atomic_json(path, value):
@@ -112,7 +114,7 @@ def protocol_for(args):
     qa_tag = qa_model.replace('/', '_').replace('-', '_')
     benchmark = getattr(args, 'benchmark', 'longlamp')
     task = getattr(args, 'task', 'abstract_generation')
-    prefix = f'{benchmark}-{task}-history-validation-multiseed-v1'
+    prefix = f'{benchmark}-{task}-history-pareto-stability-v2'
     if getattr(args, 'search_strategy', 'greedy') == 'archive_beam':
         return f'{prefix}-per-user-code-v5-archive-beam-planned-smoke-weighted-agent-{agent_tag}-qa-{qa_tag}'
     return f'{prefix}-{PROTOCOL}-agent-{agent_tag}-qa-{qa_tag}'
@@ -242,6 +244,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
             if selection_summary['errors']:
                 raise RuntimeError('Selected seed failed historical validation recheck')
             state['selection_summary'] = selection_summary
+            state['selection_predictions_path'] = str(directory/'seed_selection_predictions.jsonl')
             evo.write_jsonl(directory/'seed_selection_predictions.jsonl', selection_predictions)
         if getattr(args, 'seed_pool', False):
             original = evo.load_jsonl(directory/(seed_name+'_seed_fit.jsonl'))
@@ -251,7 +254,15 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
                 seed_name=seed_name, repeated_samples=len(predictions), changed_samples=differences,
                 first_weighted_score=seed_results[best]['fit']['weighted_score'],
                 repeat_weighted_score=baseline['weighted_score'],
+                execution_audit=compare_executions(original, predictions),
                 note='Fresh requests, no response cache; any changes indicate execution nondeterminism.'))
+            if not compare_executions(original, predictions)['stable']:
+                raise RuntimeError('Selected seed is not reproducible; inspect seed_repeat_audit.json before formal evolution')
+            if selection_rows:
+                held_audit = compare_executions(evo.load_jsonl(directory/(seed_name+'_seed_selection.jsonl')), selection_predictions)
+                atomic_json(directory/'seed_selection_repeat_audit.json', held_audit)
+                if not held_audit['stable']:
+                    raise RuntimeError('Selected seed selection is not reproducible; inspect seed_selection_repeat_audit.json')
         atomic_json(state_path, state)
 
     # State and its completion event form a recoverable commit: the event is
@@ -512,11 +523,10 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
             tuple(-value for value in adapter.score_key(b['summary'])),
         ))
         for candidate in ranked:
-            if not adapter.wins(candidate['summary'], summary):
-                continue
-            if selection_rows and (candidate['selection_summary']['errors'] or
-                    adapter.weighted_score(candidate['selection_summary']) + 1e-12 <
-                    adapter.weighted_score(state['selection_summary'])):
+            if not historical_improvement(adapter, candidate['summary'], summary,
+                    candidate.get('selection_summary'), state.get('selection_summary')):
+                atomic_json(directory/(candidate['candidate_id']+'_admission.json'), dict(
+                    accepted=False, reason='no_error_free_historical_pareto_improvement'))
                 continue
             publish('confirming:' + candidate['candidate_id'])
             ccode, _, _ = read_branch(candidate)
@@ -528,11 +538,19 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
                 parent_repeat = evaluate(code, candidate['candidate_id']+':parent_recheck')
                 confirmation = dict(candidate=adapter.summarize_rows(confirmed, trace_limit=len(rows)),
                                     parent=adapter.summarize_rows(parent_repeat, trace_limit=len(rows)))
+                confirmation['execution_audit'] = {
+                    'candidate_fit': compare_executions(evo.load_jsonl(Path(candidate['predictions_path'])), confirmed),
+                    'parent_fit': compare_executions(evo.load_jsonl(Path(state['predictions_path'])), parent_repeat),
+                }
                 if selection_rows:
                     held_child = evaluate(ccode, candidate['candidate_id']+':selection_confirm', selection_rows)
                     held_parent = evaluate(code, candidate['candidate_id']+':selection_parent_recheck', selection_rows)
                     confirmation['selection_candidate'] = adapter.summarize_rows(held_child, trace_limit=0)
                     confirmation['selection_parent'] = adapter.summarize_rows(held_parent, trace_limit=0)
+                    confirmation['execution_audit']['candidate_selection'] = compare_executions(
+                        evo.load_jsonl(directory/(candidate['candidate_id']+'_selection_predictions.jsonl')), held_child)
+                    confirmation['execution_audit']['parent_selection'] = compare_executions(
+                        evo.load_jsonl(Path(state['selection_predictions_path'])), held_parent)
                     evo.write_jsonl(directory/(candidate['candidate_id']+'_selection_confirmed.jsonl'), held_child)
                     evo.write_jsonl(directory/(candidate['candidate_id']+'_selection_parent.jsonl'), held_parent)
                 evo.write_jsonl(directory/(candidate['candidate_id']+'_confirmed_predictions.jsonl'), confirmed)
@@ -540,14 +558,18 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
                 atomic_json(cpath, confirmation)
             repeat_summary = confirmation['candidate']
             # Same training data, fresh executions; not a claim of statistical significance.
-            accepted = not confirmation['parent']['errors'] and adapter.wins(repeat_summary, summary) and adapter.wins(repeat_summary, confirmation['parent'])
-            if selection_rows:
-                sc, sp = confirmation['selection_candidate'], confirmation['selection_parent']
-                accepted = accepted and not sc['errors'] and not sp['errors'] and (
-                    adapter.weighted_score(sc) + 1e-12 >= max(adapter.weighted_score(sp),
-                                                            adapter.weighted_score(state['selection_summary'])))
+            accepted = historical_improvement(adapter, repeat_summary, confirmation['parent'],
+                confirmation.get('selection_candidate'), confirmation.get('selection_parent')) and historical_improvement(
+                adapter, repeat_summary, summary, confirmation.get('selection_candidate'), state.get('selection_summary'))
+            stable = all(a['stable'] for a in confirmation.get('execution_audit', {}).values())
+            accepted = accepted and stable
+            atomic_json(directory/(candidate['candidate_id']+'_admission.json'), dict(
+                accepted=accepted, reason='accepted' if accepted else (
+                    'execution_instability' if not stable else 'confirmation_failed'),
+                execution_audit=confirmation.get('execution_audit', {})))
             confirmation_event = dict(event='confirmation', user_id=user_id, iteration=iteration, operation=operation,
                                       candidate_id=candidate['candidate_id'], accepted=accepted,
+                                      execution_stable=stable,
                                       child_weighted_score=repeat_summary['weighted_score'],
                                       parent_weighted_score=confirmation['parent']['weighted_score'],
                                       delta_weighted_points=round(100*(repeat_summary['weighted_score']-
@@ -559,6 +581,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, se
             if accepted:
                 if selection_rows:
                     state['selection_summary'] = confirmation['selection_candidate']
+                    state['selection_predictions_path'] = str(directory/(candidate['candidate_id']+'_selection_confirmed.jsonl'))
                 accepted_id = candidate['candidate_id']
                 state.update(code_path=candidate['code_path'],
                              predictions_path=str(directory/(accepted_id+'_confirmed_predictions.jsonl')),

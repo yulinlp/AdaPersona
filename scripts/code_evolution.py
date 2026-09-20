@@ -375,6 +375,13 @@ tokens per text (longer texts truncate); instruction is optional and task-depend
 Embedding budget: 4096 texts / 2,000,000 characters per sample; batch related texts.
 Imports: numpy, scipy, sklearn, networkx, collections, functools, itertools,
 json, math, re, statistics, string. Ordinary classes, comprehensions, exceptions work.
+Import every module you use (for example import math); no modules are implicitly injected.
+Object identity via id() is unavailable; deduplicate with content keys or profile indices.
+Use deterministic ordering and tie-breaking; set order is not a semantic ranking.
+Give randomized library algorithms explicit random_state=0 (or an equivalent fixed seed).
+Do not put complete historical reference answers in source, including comments or examples.
+Infer reusable transformations; retrieve examples from the supplied runtime profile instead.
+Avoid fixing only the single worst example at the expense of other historical tasks.
 No filesystem/network/subprocess access, downloads, introspection or model-weight training.
 No Qwen3.8 calls from runtime. Do not access qa internals. Only in-memory computation
 and the three public qa methods are available. 300s wall / 120s CPU / 8GiB address-space
