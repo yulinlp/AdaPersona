@@ -173,6 +173,7 @@ def evaluate_one(item: dict, groups: dict[str, list[dict]], clients, adapter, ar
         "evolver_visibility": "none", "time": time.time(),
     }
     record['prediction'] = predictions[0].get('prediction', '')
+    record['input_missing'] = bool(row.get('input_missing', False))
     record['error'] = predictions[0].get('error', '')
     record['code_sha256'] = __import__('hashlib').sha256(Path(item['code_path']).read_bytes()).hexdigest()
     for diagnostic in ('mae', 'rmse', 'macro_f1', 'invalid_predictions'):
@@ -198,6 +199,10 @@ def aggregate(records: list[dict], metric_names: tuple[str, ...]) -> dict:
             "users_scored": len(values), "weighted_score_100": mean("weighted_score_100"),
             "gain_vs_seed_points": round(statistics.mean(gains), 3) if gains else None,
             "errors": sum(int(value["errors"]) for value in values),
+            'missing_input_users': sum(bool(value.get('input_missing')) for value in values),
+            'nonmissing_weighted_score_100': (
+                round(statistics.mean(v['weighted_score_100'] for v in values if not v.get('input_missing')), 3)
+                if any(not v.get('input_missing') for v in values) else None),
             **{f"{metric}_100": mean(f"{metric}_100") for metric in metric_names},
             "time": max(value["time"] for value in values),
         }

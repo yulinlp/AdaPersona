@@ -9,6 +9,7 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 TASK=${TASK:-4}
 DATA_ROOT=${DATA_ROOT:-data/experiments/lamp_user_rsi}
 TRAIN=${TRAIN:-$DATA_ROOT/lamp_${TASK}/profile_adaptation.jsonl}
+SELECTION=${SELECTION:?Set SELECTION to disjoint historical selection data, or use scripts.paired_suite}
 OUTPUT_DIR=${OUTPUT_DIR:-$DATA_ROOT/lamp_${TASK}/runs/qwen38_i10_b3_adaptive}
 AGENT_URL=${AGENT_URL:-http://gpu02:18012/v1}
 AGENT_MODEL=${AGENT_MODEL:-Qwen/Qwen3.8-27B}
@@ -26,7 +27,7 @@ fi
 
 exec /share/home/sunmeng/miniconda3/envs/vllm/bin/python -u scripts/evolve_per_user.py \
   --benchmark lamp --task "$TASK" \
-  --train "$TRAIN" --output-dir "$OUTPUT_DIR" \
+  --train "$TRAIN" --selection "$SELECTION" --seed-pool --output-dir "$OUTPUT_DIR" \
   --iterations "$ITERATIONS" --branches "$BRANCHES" \
   --search-strategy archive_beam --beam-width 4 --archive-size 64 --island-count 4 \
   --agent-url "$AGENT_URL" --agent-model "$AGENT_MODEL" \

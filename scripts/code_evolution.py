@@ -752,7 +752,8 @@ def reference_literal_leak(code, rows):
     literal_set = set(literals)
     for row in rows:
         gold = ' '.join(str(row.get('target', '')).split())
-        if len(gold) >= 100 and any(gold in text for text in literals):
+        generation_reference = row.get('benchmark') == 'longlamp' or row.get('task') in (4, 5)
+        if (len(gold) >= 100 or (generation_reference and len(gold.split()) >= 4)) and any(gold in text for text in literals):
             return 'candidate embeds a complete training reference literal; infer a policy, not answers'
         sample_id = ' '.join(str(row.get('sample_id', '')).split())
         if len(sample_id) >= 8 and sample_id in literal_set:
@@ -827,7 +828,15 @@ def parse_operation_choice(response):
         text = '\n'.join(text.splitlines()[1:])
         if text.rstrip().endswith('```'):
             text = text.rstrip()[:-3]
-    tree = ast.parse(text)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        # Formatting preambles are not executable code. Recover only the two
+        # literal assignment lines; malformed quotes still require a repair.
+        lines = re.findall(r'^\s*(?:operation|reason)\s*=.*$', text, re.M)
+        if len(lines) != 2:
+            raise ValueError('Decision needs exactly two unambiguous literal assignments')
+        tree = ast.parse('\n'.join(line.strip() for line in lines))
     values = {}
     for node in tree.body:
         if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
@@ -891,8 +900,20 @@ EVIDENCE:\n'''
         response = agent_chat(agent_api_url, agent_api_model, prompt,
                               timeout=agent_timeout, retries=2, retry_wait=2,
                               max_tokens=None, record=record)
-    # Fail rather than silently substituting a hand-designed operation schedule.
-    return parse_operation_choice(response)
+    for attempt in range(3):
+        try:
+            return parse_operation_choice(response)
+        except (ValueError, SyntaxError) as error:
+            record({'phase': 'operation_format_failed', 'attempt': attempt, 'error': str(error)})
+            if attempt == 2:
+                raise
+            repair = ('Repair ONLY the serialization of the following operation decision. '
+                      'Preserve its chosen operation and rationale. Output exactly two valid Python '
+                      'string-literal assignments: operation and reason. Escape internal quotes, '
+                      'do not prepend prose or change the decision.\n' + response)
+            with request_gate if request_gate is not None else nullcontext():
+                response = agent_chat(agent_api_url, agent_api_model, repair, timeout=agent_timeout,
+                                      retries=2, retry_wait=2, max_tokens=None, record=record)
 
 
 def plan_hypotheses(*, parent_code, operation, iteration, count, current_summary,
@@ -1111,10 +1132,18 @@ def evaluate_code(
         }
         try:
             result["prediction"] = run_isolated(code, runtime_row(row), qa, timeout=sample_timeout)
+            try:
+                from .profile_protocol import task_hint_loss
+            except ImportError:
+                from profile_protocol import task_hint_loss
+            lost = task_hint_loss(row, qa.trace)
+            if lost:
+                raise ValueError('Task information lost before LLM calls: ' + repr(lost))
         except Exception as error:  # candidate failures become failure-bank evidence
             result["error"] = f"{type(error).__name__}: {error}"[:500]
         result["qa_calls"] = qa.calls
         result["qa_trace"] = list(qa.trace)[:8]
+        result['input_missing'] = bool(row.get('input_missing', False))
         return index, result
 
     started = time.perf_counter()

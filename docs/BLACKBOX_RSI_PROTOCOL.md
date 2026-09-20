@@ -16,17 +16,17 @@ access files, networks, subprocesses, model weights, gradients, logits, or
 hidden states. It may implement retrieval, profile cards, graph-like memory,
 candidate generation, revision, or another in-memory black-box workflow.
 
-The outer Code Agent edits complete Python source. It is not available inside
-the runtime harness. The default answer model is Qwen2.5-7B-Instruct, but the
-runner accepts an arbitrary served QA model through `--qa-model`; this supports
-the Qwen3.8/Qwen3.8 comparison without changing the interface.
+The outer Code Agent is always Qwen3.8 and edits complete Python source. It is
+not available inside the runtime harness. The paired experiment separately
+uses Qwen2.5-7B and Qwen3.8 as frozen Answer Models.
 The runtime QA broker clamps generation to deterministic temperature `0`,
 `top_p=1`, `top_k=1`, and seed `0`; stochasticity belongs to the outer
 evolution agent, not official harness scoring.
 
 ## Search
 
-Each iteration runs a macro strategy operation and a micro repair operation.
+Each of 10 rounds chooses either macro strategy exploration or micro repair,
+with at most three candidate slots total. There is no forced alternation.
 The archive-beam search allocates branches over high-scoring, diverse, and
 under-explored parents. The Code Agent first proposes distinct hypotheses and
 then writes complete source for each hypothesis. Invalid code, duplicate ASTs,
@@ -34,9 +34,10 @@ runtime failures, and service failures are recorded in the per-user failure
 bank. The failure bank, history, and archived source/diffs are fed back to
 later proposals for that same user only.
 
-An accepted candidate must have zero errors and a strictly higher weighted score
-than its parent. It is executed again together with a parent recheck before the
-state advances. The objective is:
+The starting program is selected among five seeds on independent historical
+selection tasks. Candidates require zero errors, strict fitting improvement and
+no historical-selection regression. Both partitions are rechecked on candidate
+and parent before acceptance. For text generation the objective is:
 
 `0.25*ROUGE-1 + 0.35*ROUGE-L + 0.20*BLEU + 0.20*METEOR`.
 
@@ -49,16 +50,17 @@ For strict user split evaluation, the official test user is unseen during
 training. Its historical profile is split into leave-one-out pseudo tasks:
 
 - `profile_adaptation.jsonl` is used for per-user evolution;
-- `profile_selection.jsonl` optionally chooses seed versus evolved incumbent;
-- `test.jsonl` is evaluated only after the harness is frozen.
+- `profile_selection.jsonl` selects the initial seed and gates candidate acceptance;
+- all selection examples are removed from fitting profiles and diagnostics;
+- `test.jsonl` is scored independently after seed and each committed round.
 
 The pseudo references are historical profile abstracts. They are allowed
 profile evidence, not the official test target. The final scorer uses the
 official test target only outside the harness to calculate metrics.
 
 The same profile-only adapter supports the original LaMP user split for tasks
-2, 3, 4, and 5 only. LaMP-2 uses exact label accuracy plus label overlap;
-LaMP-3 uses exact rating accuracy plus rating closeness; LaMP-4 and LaMP-5
+2, 3, 4, and 5 only. LaMP-2 optimizes exact label accuracy;
+LaMP-3 optimizes rating closeness (1 - MAE/4); LaMP-4 and LaMP-5
 reuse the text-overlap objective above. LaMP-QA and LaMP-1/6/7 are outside
 this protocol. See `scripts/lamp_tasks.py` and
 `scripts/evaluate_lamp_test.py`.

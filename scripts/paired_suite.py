@@ -20,6 +20,7 @@ from scripts import code_evolution as evo
 from scripts.evolve_per_user import LongLaMPAdapter, LimitedQA, atomic_json
 from scripts.lamp_tasks import LampTaskAdapter
 from scripts.embedding_client import EmbeddingClient
+from scripts.profile_protocol import build_history_partitions, missing_text
 
 MODELS = {
     'qwen25': ('http://gpu01:8000/v1', 'Qwen2.5-7B-Instruct'),
@@ -94,19 +95,26 @@ def prepare(root, users):
                 if len(test_rows) >= users:
                     break
         ids = {str(r['user_id']) for r in test_rows}
-        train = []
-        with (source/'profile_adaptation.jsonl').open() as handle:
-            for line in handle:
-                # Read one row at a time; do not load multi-GB full datasets.
-                row = json.loads(line)
-                if str(row['user_id']) in ids:
-                    train.append(row)
+        train, selection, audits = [], [], []
+        for row in test_rows:
+            fit, held, audit = build_history_partitions(str(row['user_id']), row['profile'], benchmark, task)
+            train.extend(fit)
+            selection.extend(held)
+            # Retain missing-input official tasks. Annotate; never filter by score.
+            row['input_missing'] = any(placeholder in row['input'].lower()
+                                      for placeholder in ('no abstract available', 'without abstract'))
+            if benchmark == 'longlamp':
+                row['input_contract'] = 'preserve_task_hints'
+            audits.append(dict(user_id=row['user_id'], **audit))
         if len(ids) != users or ids != {str(r['user_id']) for r in train}:
             raise ValueError(f'Incomplete or duplicate cohort: {name}')
         evo.write_jsonl(cohort/'test.jsonl', test_rows)
         evo.write_jsonl(cohort/'profile_adaptation.jsonl', train)
+        evo.write_jsonl(cohort/'profile_selection.jsonl', selection)
+        atomic_json(cohort/'history_audit.json', audits)
         atomic_json(cohort/'manifest.json', dict(users=sorted(ids), selection='first N in source file; no scores used',
-            source=str(source), adaptation_rows=len(train), test_rows=len(test_rows),
+            source=str(source), adaptation_rows=len(train), selection_rows=len(selection), test_rows=len(test_rows),
+            missing_input_users=[r['user_id'] for r in test_rows if r['input_missing']],
             train_sha256=hashlib.sha256((cohort/'profile_adaptation.jsonl').read_bytes()).hexdigest(),
             test_sha256=hashlib.sha256((cohort/'test.jsonl').read_bytes()).hexdigest()))
         for model in MODELS:
@@ -136,7 +144,11 @@ def run_baselines(spec, root):
                 qa_concurrency=1, sample_timeout=420, label=f'{spec["name"]}:{method}')
             records = [r for r in records if r['user_id'] != row['user_id']] + prediction
             evo.write_jsonl(path, records)
-            atomic_json(destination/(method+'_summary.json'), adapter.summarize_rows(records, trace_limit=0))
+            summary = adapter.summarize_rows(records, trace_limit=0)
+            nonmissing = [r for r in records if not r.get('input_missing')]
+            summary['missing_input_users'] = len(records) - len(nonmissing)
+            summary['nonmissing_summary'] = adapter.summarize_rows(nonmissing, trace_limit=0) if nonmissing else None
+            atomic_json(destination/(method+'_summary.json'), summary)
         if any(r.get('error') for r in records) or len(records) != len(test):
             raise RuntimeError(f'Incomplete baseline {spec["name"]}:{method}; inspect predictions')
 
@@ -148,15 +160,18 @@ def monitor_command(spec, root):
         command += ['--task', str(spec['task'])]
     return command
 
-def run_rsi(spec, root, iterations, branches):
+def run_rsi(spec, root, iterations, branches, *, user_workers=1, agent_concurrency=1,
+            qa_concurrency=16, rsi_only=False):
     run = root/'rsi'/spec['name']
     url, model = MODELS[spec['model']]
     command = [sys.executable, '-u', '-m', 'scripts.evolve_per_user',
         '--benchmark', spec['benchmark'], '--train', str(Path(spec['cohort'])/'profile_adaptation.jsonl'),
+        '--selection', str(Path(spec['cohort'])/'profile_selection.jsonl'), '--seed-pool',
         '--output-dir', str(run), '--iterations', str(iterations), '--branches', str(branches),
         '--search-strategy', 'archive_beam', '--beam-width', '4', '--archive-size', '64', '--island-count', '4',
         '--agent-url', MODELS['qwen38'][0], '--agent-model', MODELS['qwen38'][1],
-        '--qa-url', url, '--qa-model', model, '--user-workers', '1', '--agent-concurrency', '1']
+        '--qa-url', url, '--qa-model', model, '--user-workers', str(user_workers),
+        '--agent-concurrency', str(agent_concurrency), '--qa-concurrency', str(qa_concurrency)]
     if spec['task'] is not None:
         command += ['--task', str(spec['task'])]
     with (root/'logs'/(spec['name']+'_rsi.log')).open('a') as log, (root/'logs'/(spec['name']+'_monitor.log')).open('a') as monitorlog:
@@ -180,9 +195,9 @@ def run_rsi(spec, root, iterations, branches):
                                 cwd=root/'code_snapshot')
         if result.returncode:
             raise RuntimeError('Final test monitor failed')
-    verify_complete(spec, root, iterations)
+    verify_complete(spec, root, iterations, require_baselines=not rsi_only)
 
-def verify_complete(spec, root, iterations):
+def verify_complete(spec, root, iterations, *, require_baselines=True):
     from scripts.evolve_per_user import user_key
     scores = evo.load_jsonl(root/'test_monitor'/spec['name']/'per_round_scores.jsonl')
     for user in spec['users']:
@@ -192,7 +207,7 @@ def verify_complete(spec, root, iterations):
         done = {r['iteration'] for r in scores if r['user_id'] == user and not r['errors']}
         if done != set(range(iterations+1)):
             raise RuntimeError(f'Missing/error test rounds for {user}: {sorted(done)}')
-        for method in METHODS:
+        for method in METHODS if require_baselines else ():
             rows = evo.load_jsonl(root/'baseline'/spec['name']/(method+'_predictions.jsonl'))
             if not any(r['user_id'] == user and not r.get('error') for r in rows):
                 raise RuntimeError('Missing paired baseline')
@@ -204,8 +219,14 @@ def main():
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--iterations', type=int, default=10)
     parser.add_argument('--branches', type=int, choices=(1,2,3), default=3)
+    parser.add_argument('--rsi-only', action='store_true', help='Skip official-test baselines; retain history-only RSI seed selection')
+    parser.add_argument('--user-workers', type=int, default=1)
+    parser.add_argument('--agent-concurrency', type=int, default=1)
+    parser.add_argument('--qa-concurrency', type=int, default=16)
     parser.add_argument('--only', help='Optional exact configuration name for smoke tests')
     args = parser.parse_args()
+    if min(args.users, args.workers, args.user_workers, args.agent_concurrency, args.qa_concurrency, args.iterations) < 1:
+        parser.error('User counts, budgets and concurrency must be positive')
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
     for folder in ('logs', 'status'):
@@ -228,6 +249,8 @@ def main():
             raise ValueError('Suite source changed; use a fresh experiment directory')
         if manifest['iterations'] != args.iterations or manifest['branches'] != args.branches or manifest['users_per_task'] != args.users:
             raise ValueError('Cannot change suite protocol on resume')
+        if bool(manifest.get('rsi_only', False)) != args.rsi_only:
+            raise ValueError('Cannot change baseline coverage on resume')
         specs = manifest['configurations']
     else:
         # Execute workers/monitors from an immutable source copy, so editing
@@ -245,15 +268,21 @@ def main():
         if not specs:
             raise ValueError('No matching configuration')
         atomic_json(manifest_path, dict(configurations=specs, iterations=args.iterations, branches=args.branches,
-            users_per_task=args.users, models=MODELS, methods=METHODS, created=time.time(), source_hash=source_hash,
+            users_per_task=args.users, models=MODELS, methods=[] if args.rsi_only else METHODS,
+            rsi_only=args.rsi_only, user_workers=args.user_workers, agent_concurrency=args.agent_concurrency,
+            qa_concurrency=args.qa_concurrency, configuration_workers=args.workers,
+            created=time.time(), source_hash=source_hash,
             baseline_definition='local black-box implementations, not paper-exact reproductions'))
     def execute(spec):
         status = root/'status'/(spec['name']+'.json')
         try:
-            atomic_json(status, dict(phase='baseline_running'))
-            run_baselines(spec, root)
-            run_rsi(spec, root, args.iterations, args.branches)
-            atomic_json(status, dict(phase='complete', paired_users=spec['users']))
+            if not args.rsi_only:
+                atomic_json(status, dict(phase='baseline_running'))
+                run_baselines(spec, root)
+            run_rsi(spec, root, args.iterations, args.branches,
+                    user_workers=args.user_workers, agent_concurrency=args.agent_concurrency,
+                    qa_concurrency=args.qa_concurrency, rsi_only=args.rsi_only)
+            atomic_json(status, dict(phase='complete', users=spec['users'], baselines_required=not args.rsi_only))
             return True
         except Exception as error:
             atomic_json(status, dict(phase='failed', error=type(error).__name__+': '+str(error)))

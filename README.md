@@ -23,14 +23,18 @@ There are no mandatory internal modules. The Code Agent may implement lexical/se
 
 For each user:
 
-1. Construct up to eight leave-one-out tasks from their historical profile. Each task hides its historical answer and removes its source item from the runtime history. Historical outputs are self-supervised adaptation targets, not the current official test answer.
-2. Evaluate a retrieval-based seed harness on those adaptation tasks.
+1. Partition usable historical examples deterministically into up to eight fitting tasks and up to four selection tasks (smaller profiles use smaller sets). All selection examples are removed from fitting profiles as well as fitting targets. Each task also excludes its own historical source item. Historical outputs are self-supervised targets, not official test answers.
+2. Evaluate the retrieval seed, Full Context, RAG, PAG and CoT on these historical tasks. Choose the best seed by selection score, breaking ties with fitting score, and retain the other fitting-evaluated seeds in the archive. No official test score is involved.
 3. For each of **10 rounds**, the Code Agent chooses **one** operation: `macro_strategy` (change strategy) or `micro_repair` (refine implementation). There is no alternation schedule or operation quota.
 4. Propose at most **3 candidate programs total per round**. Archive-beam search retains alternative lineages rather than following only accepted programs. By default one slot is reserved for the incumbent; the rest explore archive parents when available. `--incumbent-slots` exposes this search-policy choice.
-5. Validate and execute candidates in disposable processes. The failure bank records historical-adaptation errors and regressions. Acceptance requires zero execution errors, a strict objective improvement, and fresh candidate/parent rechecks. Otherwise keep the incumbent.
+5. Validate and execute candidates in disposable processes. The failure bank records fitting errors and regressions only. Rank candidates by historical selection score, then fitting score. Acceptance requires zero errors, a strict fitting improvement, no historical-selection regression, and fresh candidate/parent rechecks on both partitions. Otherwise keep the incumbent. Selection examples, predictions and detailed scores are never passed to the Code Agent.
 6. Independently evaluate the incumbent on the user's official test task after the seed and every committed round.
 
 Ten rounds provide at most 30 candidate slots, not 30 accepted improvements. Seed evaluations, syntax-repair requests, smoke executions and confirmation executions consume additional compute. This is recursive **code** improvement, not gradient training. No meta-policy is trained in these experiments.
+
+For LongLaMP, historical abstract tasks use full phrase hints extracted deterministically from the historical abstract, not isolated words copied from the title. This heuristic improves format alignment but is not an exact reproduction of the benchmark's keyword construction. An execution audit verifies that the title and every supplied phrase reach the Answer Model intact, allowing multi-call decomposition. It does not prescribe retrieval or memory architecture. Historical generative reference strings cannot be embedded directly in candidate source; examples must be retrieved from the runtime profile.
+
+Seed-repeat audits compare fresh requests without caching, and report output changes instead of assuming server determinism. This does not eliminate all execution noise.
 
 ## Evaluation boundary
 
@@ -39,6 +43,8 @@ We use user-split data and perform profile-only adaptation separately for select
 The runtime receives the current input and profile, never its reference. Test outputs are stored outside the evolution directory and are not used for candidate selection, early stopping, cohort selection, or choosing a reported best iteration. The primary comparison uses the incumbent after the predeclared 10 rounds; per-round test curves are descriptive monitoring only.
 
 This is history-supervised test-time adaptation, not adaptation without any reference signal. Inspecting test curves while redesigning the method can still introduce researcher-level test tuning. A separate untouched cohort is needed for a final confirmatory evaluation.
+
+The historical selection set is queried adaptively and its accept/reject outcome is visible indirectly; it is not an unbiased generalization estimate. It reduces direct fitting-set selection bias but cannot guarantee improvement on an official test task.
 
 ## Experiments
 
@@ -72,6 +78,8 @@ These are reproducible local baselines, **not claims of paper-exact reproduction
 
 The initial suite uses **2 users per task**, selected in source-file order before scoring: 5 tasks × 2 Answer Models = 10 configurations. This is an operational pilot, not enough for population-level claims. Increase `--users` for larger runs.
 
+Official tasks with missing abstract placeholders remain in the cohort. Reports annotate missing inputs and show the nonmissing subset separately; they do not remove users after looking at scores. Missing historical inputs are ineligible for constructing historical fitting/selection tasks. Users with fewer than three usable historical examples produce an explicit preparation error, not a silent test-based replacement.
+
 ## Metrics and determinism
 
 - Text generation: report ROUGE-1, ROUGE-2, ROUGE-L, BLEU and METEOR. Optimize `0.25*ROUGE-1 + 0.35*ROUGE-L + 0.20*BLEU + 0.20*METEOR`.
@@ -101,7 +109,7 @@ python scripts/lamp_tasks.py --source-root data/benchmarks/LaMP/user \
 # Repeat for tasks 3, 4 and 5.
 ```
 
-The suite expects `profile_adaptation.jsonl` and `test.jsonl` under:
+The suite reads `test.jsonl` (including each user's historical profile) under:
 
 ```text
 data/experiments/longlamp_abstract_user_rsi_tta/
@@ -122,7 +130,24 @@ python -u -m scripts.paired_suite \
   --users 2 --workers 4 --iterations 10 --branches 3
 ```
 
-The suite fixes a cohort manifest, runs all baselines for a configuration, starts its RSI plus per-round monitor, and verifies per-user completeness before marking it complete. Four configurations run concurrently; others queue. Failures are explicitly marked. Rerun with the same directory/protocol to resume; source or configuration changes require a fresh directory.
+The suite fixes a cohort manifest, rebuilds disjoint `profile_adaptation.jsonl` and `profile_selection.jsonl` using only the profiles, runs all baselines for a configuration, starts its RSI plus per-round monitor, and verifies per-user completeness before marking it complete. Four configurations run concurrently; others queue. Failures are explicitly marked. Rerun with the same directory/protocol to resume; source or configuration changes require a fresh directory. Direct evolution launches require `--selection`; use `--seed-pool` to enable the multiple starting programs.
+
+To run only RSI, skipping the separate official-test baseline benchmark:
+
+```bash
+python -u -m scripts.paired_suite \
+  --output-dir data/experiments/rsi_only_history_validation \
+  --users 2 --workers 10 --user-workers 2 \
+  --agent-concurrency 6 --qa-concurrency 8 \
+  --iterations 10 --branches 3 --rsi-only
+```
+
+This starts up to 20 user searches across 10 configurations. Each configuration
+permits up to 6 concurrent Code Agent requests and 8 Answer Model requests;
+actual utilization depends on the current search phase and serving capacity.
+Independent test monitors add a small separate inference load. The five
+historical seed evaluations remain part of RSI initialization; `--rsi-only`
+does not bypass historical selection or per-round official-test monitoring.
 
 Artifacts under the output directory:
 

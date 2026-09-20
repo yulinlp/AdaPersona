@@ -12,6 +12,10 @@ import os
 import shutil
 import fcntl
 import statistics
+import sys
+
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
     from . import code_evolution as evo
@@ -108,7 +112,7 @@ def protocol_for(args):
     qa_tag = qa_model.replace('/', '_').replace('-', '_')
     benchmark = getattr(args, 'benchmark', 'longlamp')
     task = getattr(args, 'task', 'abstract_generation')
-    prefix = f'{benchmark}-{task}-adaptive-single-operation-v1'
+    prefix = f'{benchmark}-{task}-history-validation-multiseed-v1'
     if getattr(args, 'search_strategy', 'greedy') == 'archive_beam':
         return f'{prefix}-per-user-code-v5-archive-beam-planned-smoke-weighted-agent-{agent_tag}-qa-{qa_tag}'
     return f'{prefix}-{PROTOCOL}-agent-{agent_tag}-qa-{qa_tag}'
@@ -118,12 +122,16 @@ def tools_reference(packages):
     return evo.load_strategy_library() + '\nInstalled optional package versions: ' + json.dumps(packages)
 
 
-def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
+def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None, selection_rows=None):
     adapter = adapter or adapter_for(args)
     if not rows or {str(r['user_id']) for r in rows} != {user_id}:
         raise ValueError('User isolation violation')
     if not 1 <= args.branches <= 3:
         raise ValueError('Each round supports at most three candidates')
+    selection_rows = list(selection_rows or [])
+    if selection_rows and ({str(r['user_id']) for r in selection_rows} != {user_id} or
+            {r['sample_id'] for r in rows} & {r['sample_id'] for r in selection_rows}):
+        raise ValueError('History selection isolation violation')
     directory = args.output_dir / 'users' / user_key(user_id)
     protocol = protocol_for(args)
     agent_model = getattr(args, 'agent_model', 'Qwen/Qwen3.8-27B')
@@ -143,6 +151,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
         'metrics': adapter.metric_protocol,
         'objective_protocol': adapter.objective_protocol,
         'objective_weights': adapter.objective_weights, 'dataset': dataset_hash,
+        'history_selection': selection_rows, 'seed_pool': getattr(args, 'seed_pool', False),
         'iterations': args.iterations, 'branches': args.branches,
         'search_strategy': getattr(args, 'search_strategy', 'greedy'),
         'beam_width': getattr(args, 'beam_width', 1),
@@ -180,6 +189,38 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
             raise ValueError('Resume protocol/data/config/source differs; use a fresh output directory')
     else:
         code = adapter.seed_code
+        seed_name = 'retrieval_seed'
+        if getattr(args, 'seed_pool', False):
+            if not selection_rows:
+                raise ValueError('Multiple seed selection requires independent history-selection rows')
+            from scripts.paired_suite import BASELINE, METHODS
+            seeds = [('retrieval_seed', code)] + [
+                (method, f'METHOD={method!r}\nOUTPUT_TOKENS={256 if getattr(args, "benchmark", "longlamp") == "longlamp" else 128}\n'+BASELINE)
+                for method in METHODS]
+            seed_results = []
+            for name, source in seeds:
+                fit_predictions = evaluate(source, 'seed_pool:'+name)
+                held_predictions = evaluate(source, 'seed_selection:'+name, selection_rows)
+                fit_summary = adapter.summarize_rows(fit_predictions, trace_limit=0)
+                held_summary = adapter.summarize_rows(held_predictions, trace_limit=0)
+                evo.write_jsonl(directory/(name+'_seed_fit.jsonl'), fit_predictions)
+                evo.write_jsonl(directory/(name+'_seed_selection.jsonl'), held_predictions)
+                seed_path = directory/('initial_'+name+'.py')
+                evo.save_code(seed_path, source)
+                if not fit_summary['errors']:
+                    archive.append(dict(event='candidate_evaluated', candidate_id='initial_'+name,
+                        code_path=str(seed_path), predictions_path=str(directory/(name+'_seed_fit.jsonl')),
+                        iteration=0, operation='seed_pool', **{k:v for k,v in fit_summary.items() if k != 'worst_traces'}))
+                seed_results.append(dict(name=name, fit=fit_summary, selection=held_summary))
+            atomic_json(directory/'seed_pool_scores.json', seed_results)
+            eligible = [i for i,r in enumerate(seed_results) if not r['fit']['errors'] and not r['selection']['errors']]
+            if not eligible:
+                raise RuntimeError('No seed passed both fit and historical selection evaluations')
+            best = max(eligible, key=lambda i: (adapter.weighted_score(seed_results[i]['selection']),
+                                              adapter.weighted_score(seed_results[i]['fit'])))
+            code = seeds[best][1]
+            seed_name = seeds[best][0]
+            evo.write_jsonl(archive_path, archive)
         predictions = evaluate(code, 'seed')
         baseline = adapter.summarize_rows(predictions, trace_limit=len(rows))
         if baseline['errors']:
@@ -191,10 +232,26 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
                                               candidate_id='seed', max_entries=len(rows)))
         state = dict(protocol=protocol, benchmark=getattr(args, 'benchmark', 'longlamp'),
                      task=getattr(args, 'task', 'abstract_generation'), config_hash=config_hash, dataset_hash=dataset_hash,
-                     user_id=user_id, baseline=baseline, summary=baseline,
+                     user_id=user_id, baseline=baseline, summary=baseline, seed_name=seed_name,
                      completed_operations=0, exploration=None,
                      code_path=str(directory/'seed.py'),
                      predictions_path=str(directory/'seed_predictions.jsonl'))
+        if selection_rows:
+            selection_predictions = evaluate(code, 'seed_selection_recheck', selection_rows)
+            selection_summary = adapter.summarize_rows(selection_predictions, trace_limit=0)
+            if selection_summary['errors']:
+                raise RuntimeError('Selected seed failed historical validation recheck')
+            state['selection_summary'] = selection_summary
+            evo.write_jsonl(directory/'seed_selection_predictions.jsonl', selection_predictions)
+        if getattr(args, 'seed_pool', False):
+            original = evo.load_jsonl(directory/(seed_name+'_seed_fit.jsonl'))
+            differences = [p['sample_id'] for p,q in zip(original,predictions)
+                           if p.get('prediction') != q.get('prediction')]
+            atomic_json(directory/'seed_repeat_audit.json', dict(
+                seed_name=seed_name, repeated_samples=len(predictions), changed_samples=differences,
+                first_weighted_score=seed_results[best]['fit']['weighted_score'],
+                repeat_weighted_score=baseline['weighted_score'],
+                note='Fresh requests, no response cache; any changes indicate execution nondeterminism.'))
         atomic_json(state_path, state)
 
     # State and its completion event form a recoverable commit: the event is
@@ -208,6 +265,7 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
     def publish(phase):
         summary, baseline = state['summary'], state['baseline']
         record = dict(user_id=user_id, phase=phase, samples=len(rows),
+                      seed_name=state.get('seed_name', 'retrieval_seed'),
                       completed_operations=state['completed_operations'],
                       benchmark=getattr(args, 'benchmark', 'longlamp'),
                       task=getattr(args, 'task', 'abstract_generation'),
@@ -240,7 +298,12 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
         '\nIndependent harness evolution for ONE isolated training user. '
         'No global user router or meta-policy. Specialize using this user\'s historical evidence. '
         'References are TRAINING diagnostics, never runtime inputs or hardcoded answers.\n' +
-        adapter.task_context)
+        adapter.task_context +
+        '\nPreserve the current task title and all complete supplied keyword phrases in LLM inputs. '
+        'Do not shorten a multiword keyword to its first word. '
+        'Do not embed historical reference titles, headlines or abstracts in source literals; '
+        'retrieve examples from row.profile instead. '
+        'A disjoint historical selection gate checks generalization; its examples and scores are not provided here.')
 
     for op_index in range(state['completed_operations'], args.iterations):
         iteration = op_index + 1
@@ -432,14 +495,28 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
             evaluated.append(dict(code_path=str(path), predictions_path=str(pred_path),
                                   summary=child_summary, candidate_id=cid))
 
+        # Validation examples/predictions never enter prompts, archives or the
+        # failure bank. Selection is adaptive, not an untouched test estimate.
+        for candidate in evaluated:
+            if selection_rows and not candidate['summary']['errors']:
+                ccode, _, _ = read_branch(candidate)
+                held = evaluate(ccode, candidate['candidate_id']+':history_selection', selection_rows)
+                candidate['selection_summary'] = adapter.summarize_rows(held, trace_limit=0)
+                evo.write_jsonl(directory/(candidate['candidate_id']+'_selection_predictions.jsonl'), held)
         # Best-observed incumbent and exploratory branch are separate states.
         accepted_id = None
         ranked = sorted(evaluated, key=lambda b: (
             b['summary']['errors'],
+            b.get('selection_summary', {}).get('errors', 0),
+            -adapter.weighted_score(b.get('selection_summary', b['summary'])),
             tuple(-value for value in adapter.score_key(b['summary'])),
         ))
         for candidate in ranked:
             if not adapter.wins(candidate['summary'], summary):
+                continue
+            if selection_rows and (candidate['selection_summary']['errors'] or
+                    adapter.weighted_score(candidate['selection_summary']) + 1e-12 <
+                    adapter.weighted_score(state['selection_summary'])):
                 continue
             publish('confirming:' + candidate['candidate_id'])
             ccode, _, _ = read_branch(candidate)
@@ -451,12 +528,24 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
                 parent_repeat = evaluate(code, candidate['candidate_id']+':parent_recheck')
                 confirmation = dict(candidate=adapter.summarize_rows(confirmed, trace_limit=len(rows)),
                                     parent=adapter.summarize_rows(parent_repeat, trace_limit=len(rows)))
+                if selection_rows:
+                    held_child = evaluate(ccode, candidate['candidate_id']+':selection_confirm', selection_rows)
+                    held_parent = evaluate(code, candidate['candidate_id']+':selection_parent_recheck', selection_rows)
+                    confirmation['selection_candidate'] = adapter.summarize_rows(held_child, trace_limit=0)
+                    confirmation['selection_parent'] = adapter.summarize_rows(held_parent, trace_limit=0)
+                    evo.write_jsonl(directory/(candidate['candidate_id']+'_selection_confirmed.jsonl'), held_child)
+                    evo.write_jsonl(directory/(candidate['candidate_id']+'_selection_parent.jsonl'), held_parent)
                 evo.write_jsonl(directory/(candidate['candidate_id']+'_confirmed_predictions.jsonl'), confirmed)
                 evo.write_jsonl(directory/(candidate['candidate_id']+'_parent_recheck.jsonl'), parent_repeat)
                 atomic_json(cpath, confirmation)
             repeat_summary = confirmation['candidate']
             # Same training data, fresh executions; not a claim of statistical significance.
             accepted = not confirmation['parent']['errors'] and adapter.wins(repeat_summary, summary) and adapter.wins(repeat_summary, confirmation['parent'])
+            if selection_rows:
+                sc, sp = confirmation['selection_candidate'], confirmation['selection_parent']
+                accepted = accepted and not sc['errors'] and not sp['errors'] and (
+                    adapter.weighted_score(sc) + 1e-12 >= max(adapter.weighted_score(sp),
+                                                            adapter.weighted_score(state['selection_summary'])))
             confirmation_event = dict(event='confirmation', user_id=user_id, iteration=iteration, operation=operation,
                                       candidate_id=candidate['candidate_id'], accepted=accepted,
                                       child_weighted_score=repeat_summary['weighted_score'],
@@ -468,6 +557,8 @@ def evolve_user(user_id, rows, args, qa, gate, library, report, adapter=None):
                 confirmation_event[f'parent_{metric}'] = confirmation['parent'].get(f'mean_{metric}', 0.0)
             save_event(confirmation_event)
             if accepted:
+                if selection_rows:
+                    state['selection_summary'] = confirmation['selection_candidate']
                 accepted_id = candidate['candidate_id']
                 state.update(code_path=candidate['code_path'],
                              predictions_path=str(directory/(accepted_id+'_confirmed_predictions.jsonl')),
@@ -536,6 +627,9 @@ def main():
     parser.add_argument('--task', type=int, choices=(2, 3, 4, 5),
                         help='LaMP task; required when --benchmark lamp')
     parser.add_argument('--train', type=Path, required=True)
+    parser.add_argument('--selection', type=Path, required=True,
+                        help='Disjoint historical selection tasks, never official test tasks')
+    parser.add_argument('--seed-pool', action='store_true', help='Select among retrieval, full context, RAG, PAG and CoT using history only')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--iterations', type=int, default=10,
                         help='Number of rounds; one agent-chosen operation per round')
@@ -548,6 +642,8 @@ def main():
                         help='Reserve this many candidates for incumbent; remaining slots explore archive')
     parser.add_argument('--user-workers', type=int, default=4)
     parser.add_argument('--agent-concurrency', type=int, default=8)
+    parser.add_argument('--qa-concurrency', type=int, default=32,
+                        help='Shared in-flight Answer Model request cap for this configuration')
     parser.add_argument('--max-users', type=int)
     parser.add_argument('--sample-timeout', type=float, default=300)
     parser.add_argument('--user-retries', type=int, default=2)
@@ -569,7 +665,7 @@ def main():
         args.task = 'abstract_generation'
     adapter = adapter_for(args)
     if min(args.iterations, args.branches, args.beam_width, args.archive_size,
-           args.island_count, args.user_workers, args.agent_concurrency) < 1:
+           args.island_count, args.user_workers, args.agent_concurrency, args.qa_concurrency) < 1:
         parser.error('iterations/branches/search widths/concurrency must be positive')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_lock = (args.output_dir/'runner.lock').open('a+')
@@ -582,7 +678,7 @@ def main():
         'isolated_runtime.py', 'harness_worker.py', 'embedding_client.py', 'evolution_metrics.py',
         'search_policy.py', 'lamp_tasks.py', 'evaluate_lamp_test.py',
         'prepare_lamp_user_tta.sh', 'run_lamp_evo.sh',
-        'run_per_user_evo.sh')] + [root/'docs'/'BLACKBOX_STRATEGY_LIBRARY.md']
+        'run_per_user_evo.sh', 'paired_suite.py', 'profile_protocol.py')] + [root/'docs'/'BLACKBOX_STRATEGY_LIBRARY.md']
     args.source_hash = hashlib.sha256(b''.join(p.read_bytes() for p in source_files)).hexdigest()
     previous_config = args.output_dir/'run_config.json'
     if previous_config.exists() and json.loads(previous_config.read_text()).get('source_hash') != args.source_hash:
@@ -592,6 +688,19 @@ def main():
     for source in source_files:
         shutil.copy2(source, snapshot/source.name)
     groups = user_groups(evo.load_jsonl(args.train))
+    selection_groups = user_groups(evo.load_jsonl(args.selection))
+    if set(groups) != set(selection_groups):
+        raise ValueError('Fit/selection user cohorts must match exactly')
+    from scripts.profile_protocol import history_key
+    for user, held in selection_groups.items():
+        if not held or any(r.get('source_split') != 'profile_selection' for r in held):
+            raise ValueError('Historical selection tasks required; official tests are forbidden')
+        protected = {r.get('historical_key') for r in held}
+        if None in protected or len(protected) != len(held):
+            raise ValueError('Historical selection keys missing or duplicated')
+        if any(r.get('historical_key') in protected or
+               any(history_key(p) in protected for p in r['profile']) for r in groups[user]):
+            raise ValueError('Selection examples leaked into fitting rows or profiles')
     for user, items in groups.items():
         if len({r['sample_id'] for r in items}) != len(items) or any(not r.get('target') or not r.get('input') for r in items):
             raise ValueError('Duplicate samples or missing train input/reference for ' + user)
@@ -607,7 +716,7 @@ def main():
         raise RuntimeError('QA context is smaller than the advertised harness contract')
     args.qa_context = int(qa_model.get('max_model_len', 8192))
     qa_template = {'enable_thinking': False} if 'qwen3' in args.qa_model.lower() else None
-    qa = LimitedQA(args.qa_url, args.qa_model, concurrency=32, request_limit=32,
+    qa = LimitedQA(args.qa_url, args.qa_model, concurrency=args.qa_concurrency, request_limit=args.qa_concurrency,
                    timeout=120, retries=1, chat_template_kwargs=qa_template)
     qa.embedding_client = EmbeddingClient(args.embedding_url,
         truncate_prompt_tokens=2048 if args.embedding_backend == 'vllm' else None)
@@ -618,7 +727,7 @@ def main():
     gate = threading.BoundedSemaphore(args.agent_concurrency)
     config = {k:str(v) if isinstance(v, Path) else v for k,v in vars(args).items()}
     config.update(unit='one_user_one_harness', users=len(users), samples=sum(len(groups[u]) for u in users),
-                  validation_used=False, test_used=False, packages=packages,
+                  validation_used=True, validation_source='disjoint_historical_profile', test_used=False, packages=packages,
                   protocol=protocol_for(args), metric_config=metric_config,
                   search_strategy=args.search_strategy, beam_width=args.beam_width,
                   archive_size=args.archive_size, island_count=args.island_count,
@@ -649,7 +758,8 @@ def main():
     def run_user(user):
         for attempt in range(args.user_retries+1):
             try:
-                return evolve_user(user, groups[user], args, qa, gate, library, report, adapter=adapter)
+                return evolve_user(user, groups[user], args, qa, gate, library, report, adapter=adapter,
+                                   selection_rows=selection_groups[user])
             except Exception as error:
                 if attempt == args.user_retries:
                     raise

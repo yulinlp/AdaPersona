@@ -15,6 +15,21 @@ from scripts.blackbox_harness import CompiledHarness, runtime_row
 
 
 class PairedSuiteTest(unittest.TestCase):
+    def test_rsi_only_completion_does_not_require_baseline_artifacts(self):
+        from scripts.paired_suite import verify_complete
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            spec=dict(name='run', users=['u'])
+            state=root/'rsi'/'run'/'users'/per.user_key('u')/'state.json'
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps(dict(completed_operations=1)))
+            monitor=root/'test_monitor'/'run'/'per_round_scores.jsonl'
+            monitor.parent.mkdir(parents=True)
+            evo.write_jsonl(monitor, [dict(user_id='u', iteration=i, errors=0) for i in (0,1)])
+            verify_complete(spec, root, 1, require_baselines=False)
+            with self.assertRaises(FileNotFoundError):
+                verify_complete(spec, root, 1, require_baselines=True)
+
     def test_answer_requests_disallow_immediate_eos(self):
         from scripts.longlamp_rsi import VLLMOpenAIClient
         client = VLLMOpenAIClient('unused', 'answer', chat_template_kwargs={'enable_thinking': False})
