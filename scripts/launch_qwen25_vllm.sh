@@ -9,6 +9,7 @@
 #SBATCH -e /share/home/sunmeng/ylhu/AdaPersona/logs/ada-qwen25-%j.err
 
 set -euo pipefail
+export PYTHONHASHSEED=0 CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 exec /share/home/sunmeng/miniconda3/envs/vllm/bin/vllm serve \
   /share/home/sunmeng/models/Qwen2.5-7B-Instruct \
@@ -18,4 +19,7 @@ exec /share/home/sunmeng/miniconda3/envs/vllm/bin/vllm serve \
   --dtype bfloat16 \
   --max-model-len 8192 \
   --gpu-memory-utilization 0.90 \
+  --max-num-seqs 1 --max-num-batched-tokens 8192 \
+  --no-enable-prefix-caching --no-enable-chunked-prefill --enforce-eager \
+  --seed 0 \
   --disable-log-requests

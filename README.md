@@ -90,6 +90,20 @@ Quality/objective scores are displayed on a 0–100 scale. Raw MAE/RMSE are lowe
 
 QA requests use temperature=0, top_p=1, top_k=1, seed=0, min_tokens=1 and thinking disabled. The one-token minimum prevents immediate EOS on tasks requiring nonempty answers; it applies equally to baselines, adaptation and test evaluation. The evolver uses temperature=0.7, top_p=0.9, without an explicit output-token cap or minimum; serving context remains a hard limit. Request settings alone do not prove server determinism. Confirmations and code hashes support auditing repeated executions.
 
+The checked-in Qwen2.5 A100 launchers use native vLLM with one scheduled QA
+sequence, eager execution, and prefix caching/chunked prefill disabled. This
+removes variable batching as a diagnostic factor and sacrifices throughput;
+it is not a proof of determinism. Verify with fresh historical request audits
+before launching RSI. Concurrent HTTP requests queue at this server. The
+co-located embedding server remains separate, on the same authorized GPU.
+
+Alternatively, `scripts/launch_qa_embedding_sglang.sh` runs native SGLang QA
+with deterministic inference, Triton attention, and up to 32 running requests;
+embedding remains a separate vLLM server. The launcher reuses the local matched
+CUDA-12.8 SGLang/kernel environment and GCC 12 toolchain; adapt these paths for other machines.
+The OpenAI-compatible request contract and frozen model weights remain unchanged.
+Audit serial and concurrent executions before trusting this configuration too.
+
 ## Run
 
 Use Python 3.11 with numpy, scipy, scikit-learn, networkx, and:

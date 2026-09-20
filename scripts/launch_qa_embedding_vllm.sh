@@ -15,6 +15,11 @@ export CUDA_VISIBLE_DEVICES=0
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export NO_PROXY=127.0.0.1,localhost,gpu01,gpu02
 export no_proxy="$NO_PROXY"
+export PYTHONHASHSEED=0
+# A100 diagnostic/reproducible serving mode. Queue concurrent HTTP requests,
+# but run one QA sequence at a time with no prefix-cache-dependent prefill.
+# Do not claim batch invariance from temperature/seed settings alone.
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 serve_bin=/share/home/sunmeng/miniconda3/envs/vllm/bin/vllm
 qa_pid=''
 embed_pid=''
@@ -29,7 +34,9 @@ trap 'exit 143' TERM INT
 "$serve_bin" serve /share/home/sunmeng/models/Qwen2.5-7B-Instruct \
   --served-model-name Qwen2.5-7B-Instruct --host 0.0.0.0 --port 8000 \
   --dtype bfloat16 --max-model-len 8192 --gpu-memory-utilization 0.78 \
-  --max-num-seqs 64 --disable-log-requests \
+  --max-num-seqs 1 --max-num-batched-tokens 8192 \
+  --no-enable-prefix-caching --no-enable-chunked-prefill --enforce-eager \
+  --seed 0 --disable-log-requests \
   > "logs/qa-colocated-${SLURM_JOB_ID:-manual}.log" 2>&1 &
 qa_pid=$!
 
